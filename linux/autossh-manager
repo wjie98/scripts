@@ -1,0 +1,275 @@
+#!/bin/bash
+
+GLOBAL_SSH_OPTS="-TqTnN"
+# GLOBAL_SSH_JUMP="hwj@10.61.190.16:18022"
+# GLOBAL_SSH_KEY="~/.ssh/id_rsa"
+
+declare -A TUNNEL_CONFIG=()
+
+# 隧道配置 (组名:隧道名字 -> 隧道参数)
+TUNNEL_CONFIG["starry:gpu02"]="type=L L=:22022 R=127.0.0.1:22022 S=gpu02"
+
+parse_tunnel_config() {
+    local tunnel_name="$1"
+    shift
+    local config_str="$@"
+
+    declare -A config=()
+
+    # 解析隧道名
+    IFS=':' read -r group_name tunnel_name <<< "$tunnel_name"
+    if [[ -z $tunnel_name ]]; then
+        config[group]="default"
+        config[name]="$group_name"
+    else
+        config[group]="$group_name"
+        config[name]="$tunnel_name"
+    fi
+
+    # 解析键值对
+    while IFS='=' read -r key value; do
+        [[ -n $key ]] && [[ -n $value ]] && config["$key"]="$value"
+    done < <(echo "$config_str" | tr ' ' '\n')
+
+    # 检查必要值
+    if [[ -z "${config[S]}" ]]; then
+        echo "Missing server (S) in tunnel configuration for ${config[group]}:${config[name]}"
+        return 1
+    fi
+
+    if [[ -z "${config[L]}" ]]; then
+        echo "Missing local port (L) in tunnel configuration for ${config[group]}:${config[name]}"
+        return 1
+    fi
+
+    if [[ -z "${config[R]}" ]]; then
+        if [[ "${config[type]}" != "D" ]]; then
+            echo "Missing remote port (R) in tunnel configuration for ${config[group]}:${config[name]}"
+            return 1
+        fi
+    fi
+
+    # 解析服务器参数
+    IFS=':' read -r server_ip server_port <<< "${config[S]}"
+    if [[ -z "$server_ip" ]]; then
+        echo "Invalid server IP in tunnel configuration for ${config[group]}:${config[name]}"
+        return 1
+    fi
+    
+    config[S]="$server_ip"
+    [[ -n "$server_port" ]] && config[P]="$server_port"
+
+    # 设置默认值
+    [[ -z "${config[type]}" ]] && config[type]="L"
+    [[ -z "${config[K]}" ]] && [[ -n "${GLOBAL_SSH_KEY}" ]] && config[K]="${GLOBAL_SSH_KEY}"
+    [[ -z "${config[J]}" ]] && [[ -n "${GLOBAL_SSH_JUMP}" ]] && config[J]="${GLOBAL_SSH_JUMP}"
+    [[ -z "${config[O]}" ]] && [[ -n "${GLOBAL_SSH_OPTS}" ]] && config[O]="${GLOBAL_SSH_OPTS}"
+
+    declare -p config | sed -e "s/^declare -A config=//"
+}
+
+get_groups() {
+    declare -a groups=()
+
+    for key in "${!TUNNEL_CONFIG[@]}"; do
+        local parsed_config=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
+        eval "declare -A cfg=${parsed_config}"
+        groups+=("${cfg[group]}")
+    done
+
+    printf "%s\n" "${groups[@]}" | sort -u
+}
+
+build_ssh_command() {
+    local config_str="$1"
+    eval "declare -A cfg=${config_str}"
+
+    local cmd="autossh -f"
+
+    [[ -n "${cfg[O]}" ]] && cmd+=" ${cfg[O]}"
+    
+    case "${cfg[type]}" in
+        L) cmd+=" -L ${cfg[L]}:${cfg[R]}" ;;
+        R) cmd+=" -R ${cfg[R]}:${cfg[L]}" ;;
+        D) cmd+=" -D ${cfg[L]}" ;;
+    esac
+
+    cmd+=" ${cfg[S]}"
+    [[ -n "${cfg[P]}" ]] && cmd+=" -p ${cfg[P]}"
+
+    [[ -n "${cfg[J]}" ]] && cmd+=" -J ${cfg[J]}"
+    [[ -n "${cfg[K]}" ]] && cmd+=" -i \"${cfg[K]}\""
+
+    echo "$cmd"
+}
+
+build_process_pattern() {
+    local config_str="$1"
+    eval "declare -A cfg=${config_str}"
+    
+    local pattern="autossh"
+    
+    case "${cfg[type]}" in
+        L) pattern+=" .*-L ${cfg[L]}:${cfg[R]}" ;;
+        R) pattern+=" .*-R ${cfg[R]}:${cfg[L]}" ;;
+        D) pattern+=" .*-D ${cfg[L]}" ;;
+    esac
+
+    pattern+=" ${cfg[S]}"
+    [[ -n "${cfg[P]}" ]] && pattern+=" -p ${cfg[P]}"
+
+    [[ -n "${cfg[J]}" ]] && pattern+=" -J ${cfg[J]}"
+    [[ -n "${cfg[K]}" ]] && pattern+=" -i \"${cfg[K]}\""
+    
+    # 移除单引号
+    pattern=$(echo "$pattern" | sed "s/'//g")
+    
+    echo "$pattern"
+}
+
+
+manage_tunnel() {
+    local action="$1"
+    local config_str="$2"
+    eval "declare -A cfg=${config_str}"
+
+    local ssh_cmd=$(build_ssh_command "$config_str")
+    local pattern=$(build_process_pattern "$config_str")
+
+    local group="${cfg[group]}"
+    local tunnel_name="${cfg[name]}"
+
+    case $action in
+        start)
+            if ! pgrep -f "$pattern" >/dev/null; then
+                echo "启动隧道: [$group] $tunnel_name"
+                eval "$ssh_cmd"
+                return $?
+            else
+                echo "隧道已在运行: [$group] $tunnel_name"
+                return 0
+            fi
+            ;;
+        stop)
+            if pgrep -f "$pattern" >/dev/null; then
+                echo "停止隧道: [$group] $tunnel_name"
+                pkill -f "$pattern"
+                return $?
+            else
+                echo "隧道未运行: [$group] $tunnel_name"
+                return 0
+            fi
+            ;;
+        status)
+            if pgrep -f "$pattern" >/dev/null; then
+                printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
+                    "[RUNNING]" "$tunnel_name" "${cfg[L]}" "${cfg[type]}" \
+                    "${cfg[R]:-N/A}" "${cfg[S]}"
+                return 0
+            else
+                printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
+                    "[STOPPED]" "$tunnel_name" "${cfg[L]}" "${cfg[type]}" \
+                    "${cfg[R]:-N/A}" "${cfg[S]}"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+
+process_group() {
+    local action=$1
+    local group=$2
+    
+    # 特殊处理：all组包含所有隧道
+    if [[ "$group" == "all" ]]; then
+        # for key in "${!TUNNEL_CONFIG[@]}"; do
+        #     local config_str=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
+        #     manage_tunnel "$action" "$config_str"
+        # done
+        for group in $TUNNEL_GROUPS; do
+            process_group "$action" "$group"
+            echo ""
+        done
+        return 0
+    fi
+    
+    # 检查组是否存在
+    local group_exists=0
+    for key in $TUNNEL_GROUPS; do
+        if [[ "$key" == "$group" ]]; then
+          group_exists=1
+          break
+        fi
+    done
+    
+    if [[ $group_exists -eq 0 ]]; then
+        echo "错误: 无效的组名 '$group'"
+        return 1
+    fi
+    
+    echo "========================================"
+    echo "处理组: $group"
+    echo "操作: $action"
+    echo "========================================"
+    printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
+        "STATUS" "NAME" "LOCAL" "TYPE" "REMOTE" "SERVER"
+    echo "------------------------------------------------------------------------------------------------"
+    for key in "${!TUNNEL_CONFIG[@]}"; do
+        local config_str=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
+        eval "declare -A cfg=${config_str}"
+
+        if [[ "${cfg[group]}" == "$group" ]]; then
+            manage_tunnel "$action" "$config_str"
+        fi
+    done
+    echo ""
+    return 0
+}
+
+
+show_usage() {
+    echo "隧道管理脚本 v3.0"
+    echo "用法: $0 {start|stop|restart|status} [组名]"
+    echo ""
+    echo "可用组:"
+    echo "  - all (所有隧道)"
+    
+    # 获取并显示所有唯一组名
+    for group in $TUNNEL_GROUPS; do
+        echo "  - $group"
+    done
+    
+    echo ""
+    echo "隧道配置选项:"
+    echo "  type=L/R/D     隧道类型 (默认: L)"
+    echo "  L=             本地端口"
+    echo "  R=             远程端口"
+    echo "  S=             登陆服务器"
+    echo "  J=             跳板机"
+}
+
+if [[ $# -lt 1 ]]; then
+    show_usage
+    exit 1
+fi
+
+ACTION=$1
+GROUP=${2:-all}
+TUNNEL_GROUPS=$(get_groups)
+
+case $ACTION in
+    start|stop|status)
+        process_group "$ACTION" "$GROUP"
+        ;;
+    restart)
+        process_group "stop" "$GROUP"
+        process_group "start" "$GROUP"
+        ;;
+    *)
+        show_usage
+        exit 1
+        ;;
+esac
+
+
