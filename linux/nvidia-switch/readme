@@ -1,0 +1,1 @@
+在/etc/modprobe.d/创建符号连接system76-nvidia.conf指向希望的配置，然后执行update-initramfs更新内核模块，重启生效
