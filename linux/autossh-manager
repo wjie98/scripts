@@ -8,6 +8,8 @@ declare -A TUNNEL_CONFIG=()
 
 # 隧道配置 (组名:隧道名字 -> 隧道参数)
 TUNNEL_CONFIG["starry:gpu02"]="type=L L=:22022 R=127.0.0.1:22022 S=gpu02"
+# 测试密钥配置的示例（注释掉，使用时取消注释）
+# TUNNEL_CONFIG["test:test-key"]="type=L L=:2222 R=127.0.0.1:22 S=test-server K=~/.ssh/id_rsa"
 
 parse_tunnel_config() {
     local tunnel_name="$1"
@@ -65,6 +67,11 @@ parse_tunnel_config() {
     [[ -z "${config[J]}" ]] && [[ -n "${GLOBAL_SSH_JUMP}" ]] && config[J]="${GLOBAL_SSH_JUMP}"
     [[ -z "${config[O]}" ]] && [[ -n "${GLOBAL_SSH_OPTS}" ]] && config[O]="${GLOBAL_SSH_OPTS}"
 
+    # 展开密钥路径中的~符号
+    if [[ -n "${config[K]}" ]]; then
+        config[K]="${config[K]/\~/$HOME}"
+    fi
+
     declare -p config | sed -e "s/^declare -A config=//"
 }
 
@@ -94,11 +101,11 @@ build_ssh_command() {
         D) cmd+=" -D ${cfg[L]}" ;;
     esac
 
-    cmd+=" ${cfg[S]}"
+    [[ -n "${cfg[K]}" ]] && cmd+=" -i ${cfg[K]}"
     [[ -n "${cfg[P]}" ]] && cmd+=" -p ${cfg[P]}"
-
     [[ -n "${cfg[J]}" ]] && cmd+=" -J ${cfg[J]}"
-    [[ -n "${cfg[K]}" ]] && cmd+=" -i \"${cfg[K]}\""
+
+    cmd+=" ${cfg[S]}"
 
     echo "$cmd"
 }
@@ -115,14 +122,11 @@ build_process_pattern() {
         D) pattern+=" .*-D ${cfg[L]}" ;;
     esac
 
-    pattern+=" ${cfg[S]}"
+    [[ -n "${cfg[K]}" ]] && pattern+=" .*-i .*${cfg[K]}"
     [[ -n "${cfg[P]}" ]] && pattern+=" -p ${cfg[P]}"
-
     [[ -n "${cfg[J]}" ]] && pattern+=" -J ${cfg[J]}"
-    [[ -n "${cfg[K]}" ]] && pattern+=" -i \"${cfg[K]}\""
-    
-    # 移除单引号
-    pattern=$(echo "$pattern" | sed "s/'//g")
+
+    pattern+=" ${cfg[S]}"
     
     echo "$pattern"
 }
