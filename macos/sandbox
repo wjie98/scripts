@@ -104,6 +104,12 @@ log()  { printf '[%s] %s\n' "${SCRIPT_NAME}" "$*" >&2; }
 warn() { printf '[%s] WARN: %s\n' "${SCRIPT_NAME}" "$*" >&2; }
 die()  { printf '[%s] ERROR: %s\n' "${SCRIPT_NAME}" "$*" >&2; exit 1; }
 
+cleanup_runtime_dir() {
+  if [[ -n "${SANDBOX_RUNTIME_DIR:-}" && -d "${SANDBOX_RUNTIME_DIR}" ]]; then
+    rm -rf -- "${SANDBOX_RUNTIME_DIR}"
+  fi
+}
+
 on_error() {
   local code=$?
   printf '[%s] ERROR: command failed at line %s: %s (exit=%s)\n' \
@@ -628,12 +634,12 @@ else
 fi
 
 SANDBOX_PROMPT_PREFIX="$(build_prompt_prefix "${NEXT_SANDBOX_LEVEL}")"
-SANDBOX_RUNTIME_DIR="/tmp/.sandbox-runtime-${UID:-$(id -u)}-$$"
+SANDBOX_RUNTIME_DIR="/tmp/sandbox-code-agent-runtime-${UID:-$(id -u)}-$$"
 SANDBOX_ZDOTDIR="${SANDBOX_RUNTIME_DIR}/zdotdir"
 SANDBOX_PROFILE="${SANDBOX_RUNTIME_DIR}/profile.sb"
 
 mkdir -p "${SANDBOX_RUNTIME_DIR}"
-trap 'rm -rf "${SANDBOX_RUNTIME_DIR}"' EXIT
+trap 'cleanup_runtime_dir' EXIT
 
 SANDBOX_SOURCE_ZSHRC="${HOME}/.zshrc"
 if [[ "${DISABLE_OH_MY_ZSH_IN_SANDBOX}" -eq 1 && -r "${HOME}/.zshrc" ]]; then
@@ -753,4 +759,5 @@ if [[ "${DEBUG_PRINT_FINAL_CMD}" -eq 1 ]]; then
 fi
 
 cd "${CWD_REAL}"
-exec "${SANDBOX_CMD[@]-}"
+"${SANDBOX_CMD[@]-}"
+exit $?
