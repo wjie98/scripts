@@ -66,6 +66,9 @@ RO_MOUNTS=(
 # Additional read-write mounts.
 RW_MOUNTS=(
   "${HOST_HOME}/.cache"
+  "${HOST_HOME}/.claude"
+  "${HOST_HOME}/.claude.json"
+  "${HOST_HOME}/.codex"
   "${HOST_HOME}/.pi"
   "${HOST_HOME}/.omp"
 )

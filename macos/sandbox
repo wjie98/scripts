@@ -1,0 +1,756 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+################################################################################
+# Config
+################################################################################
+
+# Host home directory used by config items below.
+HOST_HOME="${HOME:-/nonexistent}"
+
+# Default interactive shell when no CLI command is provided.
+DEFAULT_SHELL="zsh"
+
+# Feature toggles.
+ENABLE_NET=1
+
+# If enabled, missing configured paths become fatal errors.
+STRICT_MOUNTS=1
+
+# If enabled, the current working directory is automatically added as RW path.
+AUTO_MOUNT_CWD=1
+
+# Output controls.
+PRINT_CONFIG_SUMMARY=1
+DEBUG_PRINT_FINAL_CMD=0
+
+# If enabled, disable shell history inside sandbox.
+DISABLE_HISTORY=1
+
+# Exact directories forbidden as startup CWD.
+FORBIDDEN_CWD_EXACT=(
+  "/"
+  "/Users"
+)
+
+# Directory prefixes forbidden as startup CWD.
+FORBIDDEN_CWD_PREFIXES=(
+  "/System"
+  "/Library"
+  "/usr"
+  "/bin"
+  "/sbin"
+  "/private/etc"
+)
+
+# Allowed prefixes for RW paths.
+# If empty, no RW prefix restriction is applied.
+ALLOWED_RW_PREFIXES=(
+  # "${HOST_HOME}/projects"
+  # "${HOST_HOME}/work"
+  # "${HOST_HOME}/.cache"
+)
+
+# Additional read-only paths.
+# On macOS sandbox-exec we cannot "mount", so these are policy-visible config
+# items kept for consistent usage/printing logic.
+RO_MOUNTS=(
+)
+
+# Additional read-write paths.
+RW_MOUNTS=(
+  "${HOST_HOME}/.cache"
+  "${HOST_HOME}/.claude"
+  "${HOST_HOME}/.claude.json"
+  "${HOST_HOME}/.codex"
+  "${HOST_HOME}/.pi"
+  "${HOST_HOME}/.omp"
+)
+
+# Commands executed inside sandbox before launching the final command.
+PRE_COMMANDS=(
+)
+
+# Environment variables to unset inside sandbox.
+UNSET_ENVS=(
+  "DYLD_LIBRARY_PATH"
+  "DYLD_FRAMEWORK_PATH"
+  "DYLD_INSERT_LIBRARIES"
+  "PYTHONPATH"
+  "CONDA_PREFIX"
+  "CONDA_DEFAULT_ENV"
+  "VIRTUAL_ENV"
+  "BASH_ENV"
+  "ENV"
+)
+
+# Extra environment variables injected into sandbox.
+# Format: NAME=VALUE
+EXTRA_ENVS=(
+)
+
+# If enabled, sandbox interactive zsh will source a filtered copy of ~/.zshrc
+# with oh-my-zsh and powerlevel10k initialization removed. This preserves most
+# user configuration while keeping sandbox startup predictable.
+DISABLE_OH_MY_ZSH_IN_SANDBOX=1
+
+################################################################################
+# Helper functions
+################################################################################
+
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+
+log()  { printf '[%s] %s\n' "${SCRIPT_NAME}" "$*" >&2; }
+warn() { printf '[%s] WARN: %s\n' "${SCRIPT_NAME}" "$*" >&2; }
+die()  { printf '[%s] ERROR: %s\n' "${SCRIPT_NAME}" "$*" >&2; exit 1; }
+
+on_error() {
+  local code=$?
+  printf '[%s] ERROR: command failed at line %s: %s (exit=%s)\n' \
+    "${SCRIPT_NAME}" "${1:-unknown}" "${2:-unknown}" "${code}" >&2
+  exit "${code}"
+}
+trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+path_exists_any() {
+  local path="$1"
+  [[ -e "${path}" || -L "${path}" || -S "${path}" ]]
+}
+
+is_abs() {
+  [[ "$1" == /* ]]
+}
+
+real_path() {
+  local path="$1"
+
+  if command -v realpath >/dev/null 2>&1; then
+    realpath "${path}" 2>/dev/null && return 0
+  fi
+
+  python3 - <<'PY' "${path}" 2>/dev/null && return 0
+import os, sys
+print(os.path.realpath(sys.argv[1]))
+PY
+
+  perl -MCwd=realpath -e 'print realpath($ARGV[0])' "${path}" 2>/dev/null && return 0
+
+  die "cannot resolve real path: ${path}"
+}
+
+normalize_existing_path() {
+  local path="$1"
+  if path_exists_any "${path}"; then
+    real_path "${path}"
+  else
+    printf '%s\n' "${path}"
+  fi
+}
+
+normalize_array_paths() {
+  local name="$1"
+  local tmpfile item normalized idx count
+
+  tmpfile="$(mktemp "/tmp/${SCRIPT_NAME}.normalize.XXXXXX")"
+  : > "${tmpfile}"
+
+  eval 'count=${#'"${name}"'[@]}'
+  for ((idx=0; idx<count; idx++)); do
+    eval 'item=${'"${name}"'[idx]}'
+    [ -n "$item" ] || continue
+    normalized=$(normalize_existing_path "$item")
+    printf "%s\n" "$normalized" >> "${tmpfile}"
+  done
+
+  eval "${name}=()"
+  while IFS= read -r item; do
+    eval "${name}+=(\"\$item\")"
+  done < "${tmpfile}"
+
+  rm -f "${tmpfile}"
+}
+
+dedup_array() {
+  local name="$1"
+  local tmpfile seenfile item idx count
+
+  tmpfile="$(mktemp "/tmp/${SCRIPT_NAME}.dedup.XXXXXX")"
+  seenfile="$(mktemp "/tmp/${SCRIPT_NAME}.seen.XXXXXX")"
+  : > "${tmpfile}"
+  : > "${seenfile}"
+
+  eval 'count=${#'"${name}"'[@]}'
+  for ((idx=0; idx<count; idx++)); do
+    eval 'item=${'"${name}"'[idx]}'
+    [ -n "$item" ] || continue
+    if ! grep -Fqx -- "$item" "${seenfile}"; then
+      printf "%s\n" "$item" >> "${seenfile}"
+      printf "%s\n" "$item" >> "${tmpfile}"
+    fi
+  done
+
+  eval "${name}=()"
+  while IFS= read -r item; do
+    eval "${name}+=(\"\$item\")"
+  done < "${tmpfile}"
+
+  rm -f "${tmpfile}" "${seenfile}"
+}
+
+validate_toggle() {
+  case "$2" in
+    0|1) ;;
+    *) die "$1 must be 0 or 1, got: $2" ;;
+  esac
+}
+
+validate_abs_list() {
+  local name="$1"
+  local item idx count
+
+  eval 'count=${#'"${name}"'[@]}'
+  for ((idx=0; idx<count; idx++)); do
+    eval 'item=${'"${name}"'[idx]}'
+    [ -n "$item" ] || die "${name} contains an empty item"
+    is_abs "$item" || die "${name} contains a non-absolute path: $item"
+  done
+}
+
+validate_env_lists() {
+  local item idx count
+
+  count=${#UNSET_ENVS[@]}
+  for ((idx=0; idx<count; idx++)); do
+    item=${UNSET_ENVS[idx]}
+    [[ -n "${item}" ]] || die "UNSET_ENVS contains an empty item"
+    [[ "${item}" != *=* ]] || die "UNSET_ENVS should contain names only: ${item}"
+  done
+
+  count=${#EXTRA_ENVS[@]}
+  for ((idx=0; idx<count; idx++)); do
+    item=${EXTRA_ENVS[idx]}
+    [[ -n "${item}" ]] || die "EXTRA_ENVS contains an empty item"
+    [[ "${item}" == *=* ]] || die "EXTRA_ENVS item must be NAME=VALUE: ${item}"
+  done
+
+}
+
+validate_pre_commands() {
+  local item idx count
+  count=${#PRE_COMMANDS[@]}
+  for ((idx=0; idx<count; idx++)); do
+    item=${PRE_COMMANDS[idx]}
+    [[ -n "${item}" ]] || die "PRE_COMMANDS contains an empty item"
+  done
+}
+
+validate_optional_abs_var() {
+  local name="$1"
+  local value="${!name:-}"
+
+  [[ -n "${value}" ]] || return 0
+  is_abs "${value}" || die "${name} must be an absolute path when set: ${value}"
+}
+
+pwd_real() {
+  pwd -P || die "failed to resolve current working directory"
+}
+
+get_user_homes() {
+  dscl . -list /Users NFSHomeDirectory 2>/dev/null | awk '{print $2}' && return 0
+  [[ -n "${HOME:-}" ]] && printf '%s\n' "${HOME}" || true
+}
+
+is_exact_user_home() {
+  local target="$1"
+  local home home_real
+
+  while IFS= read -r home; do
+    [[ -n "${home}" ]] || continue
+    path_exists_any "${home}" || continue
+    home_real="$(real_path "${home}")" || continue
+    [[ "${target}" == "${home_real}" ]] && return 0
+  done < <(get_user_homes || true)
+
+  return 1
+}
+
+path_is_same_or_child() {
+  local path="$1"
+  local prefix="$2"
+
+  [[ "${prefix}" == "/" ]] && return 0
+  [[ "${path}" == "${prefix}" || "${path}" == "${prefix}/"* ]]
+}
+
+path_matches_any_prefix() {
+  local path="$1"
+  shift
+  local prefix
+
+  for prefix in "$@"; do
+    [[ -n "${prefix}" ]] || continue
+    if path_is_same_or_child "${path}" "${prefix}"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+validate_cwd_rules() {
+  local cwd="$1"
+  local path
+
+  for path in "${FORBIDDEN_CWD_EXACT[@]-}"; do
+    [[ -n "${path}" ]] || continue
+    [[ "${cwd}" != "${path}" ]] || die "current directory is forbidden: ${cwd}"
+  done
+
+  if [[ "${#FORBIDDEN_CWD_PREFIXES[@]}" -gt 0 ]] &&
+     path_matches_any_prefix "${cwd}" "${FORBIDDEN_CWD_PREFIXES[@]-}"; then
+    die "current directory is under a forbidden prefix: ${cwd}"
+  fi
+
+  if is_exact_user_home "${cwd}"; then
+    die "current directory is exactly a user's home directory: ${cwd}"
+  fi
+
+  if [[ "${AUTO_MOUNT_CWD}" -eq 1 && "${#ALLOWED_RW_PREFIXES[@]}" -gt 0 ]] &&
+     ! path_matches_any_prefix "${cwd}" "${ALLOWED_RW_PREFIXES[@]-}"; then
+    die "current directory is outside ALLOWED_RW_PREFIXES and AUTO_MOUNT_CWD=1: ${cwd}"
+  fi
+}
+
+validate_rw_mount_rules() {
+  local path
+
+  [[ "${#ALLOWED_RW_PREFIXES[@]}" -eq 0 ]] && return 0
+
+  for path in "${RW_MOUNTS[@]-}"; do
+    [[ -n "${path}" ]] || continue
+    if ! path_matches_any_prefix "${path}" "${ALLOWED_RW_PREFIXES[@]-}"; then
+      die "RW_MOUNTS path is outside ALLOWED_RW_PREFIXES: ${path}"
+    fi
+  done
+}
+
+mount_status() {
+  if path_exists_any "$1"; then
+    printf 'effective'
+  elif [[ "${STRICT_MOUNTS}" -eq 1 ]]; then
+    printf 'invalid'
+  else
+    printf 'inactive'
+  fi
+}
+
+print_status_list() {
+  local title="$1"
+  shift
+  local item
+
+  printf '[%s] %s\n' "${SCRIPT_NAME}" "${title}" >&2
+  if [[ "$#" -eq 0 ]]; then
+    printf '[%s]   - (none)\n' "${SCRIPT_NAME}" >&2
+    return 0
+  fi
+
+  for item in "$@"; do
+    [[ -n "${item}" ]] || continue
+    printf '[%s]   - %s: %s\n' "${SCRIPT_NAME}" "$(mount_status "${item}")" "${item}" >&2
+  done
+}
+
+print_plain_list() {
+  local title="$1"
+  shift
+  local item
+
+  printf '[%s] %s\n' "${SCRIPT_NAME}" "${title}" >&2
+  if [[ "$#" -eq 0 ]]; then
+    printf '[%s]   - (empty, no restriction)\n' "${SCRIPT_NAME}" >&2
+    return 0
+  fi
+
+  for item in "$@"; do
+    [[ -n "${item}" ]] || continue
+    printf '[%s]   - %s\n' "${SCRIPT_NAME}" "${item}" >&2
+  done
+}
+
+warn_mount_conflicts() {
+  local ro rw
+  for ro in "${RO_MOUNTS[@]-}"; do
+    [[ -n "${ro}" ]] || continue
+    for rw in "${RW_MOUNTS[@]-}"; do
+      [[ -n "${rw}" ]] || continue
+      [[ "${ro}" == "${rw}" ]] && warn "same path appears in both RO_MOUNTS and RW_MOUNTS, RW overrides RO: ${ro}"
+    done
+  done
+}
+
+build_prompt_prefix() {
+  local level="$1"
+  local prefix=""
+  local i
+  for ((i=0; i<level; i++)); do
+    prefix+="(sandbox)"
+  done
+  printf '%s\n' "${prefix}"
+}
+
+print_summary() {
+  local net="inactive"
+  local item
+
+  if [[ "${ENABLE_NET}" -eq 1 ]]; then
+    net="effective"
+  fi
+
+  printf '[%s] Configuration summary\n' "${SCRIPT_NAME}" >&2
+  printf '[%s]   - CWD=%s\n' "${SCRIPT_NAME}" "${CWD_REAL}" >&2
+  printf '[%s]   - ENABLE_NET=%s\n' "${SCRIPT_NAME}" "${ENABLE_NET}" >&2
+  printf '[%s]   - AUTO_MOUNT_CWD=%s\n' "${SCRIPT_NAME}" "${AUTO_MOUNT_CWD}" >&2
+  printf '[%s]   - STRICT_MOUNTS=%s\n' "${SCRIPT_NAME}" "${STRICT_MOUNTS}" >&2
+
+  printf '[%s] Runtime features:\n' "${SCRIPT_NAME}" >&2
+  printf '[%s]   - Network=%s\n' "${SCRIPT_NAME}" "${net}" >&2
+
+  print_plain_list  "Forbidden CWD exact paths:"   "${FORBIDDEN_CWD_EXACT[@]-}"
+  print_plain_list  "Forbidden CWD prefixes:"      "${FORBIDDEN_CWD_PREFIXES[@]-}"
+  print_plain_list  "Allowed RW prefixes:"         "${ALLOWED_RW_PREFIXES[@]-}"
+  print_status_list "Read-only mounts:"            "${RO_MOUNTS[@]-}"
+  print_status_list "Read-write mounts:"           "${RW_MOUNTS[@]-}"
+  printf '[%s] Interactive shell paths:\n' "${SCRIPT_NAME}" >&2
+  printf '[%s]   - XDG_CACHE_HOME=%s\n' "${SCRIPT_NAME}" "${SANDBOX_XDG_CACHE_HOME}" >&2
+  printf '[%s]   - XDG_STATE_HOME=%s\n' "${SCRIPT_NAME}" "${SANDBOX_XDG_STATE_HOME}" >&2
+  printf '[%s]   - ZSH_CACHE_DIR=%s\n' "${SCRIPT_NAME}" "${SANDBOX_ZSH_CACHE_DIR}" >&2
+  printf '[%s]   - ZSH_COMPDUMP=%s\n' "${SCRIPT_NAME}" "${SANDBOX_ZSH_COMPDUMP}" >&2
+
+  printf '[%s] PRE_COMMANDS:\n' "${SCRIPT_NAME}" >&2
+  if [[ "${#PRE_COMMANDS[@]}" -eq 0 ]]; then
+    printf '[%s]   - (none)\n' "${SCRIPT_NAME}" >&2
+  else
+    for item in "${PRE_COMMANDS[@]-}"; do
+      [[ -n "${item}" ]] || continue
+      printf '[%s]   - %s\n' "${SCRIPT_NAME}" "${item}" >&2
+    done
+  fi
+
+  printf '[%s] Final command:\n' "${SCRIPT_NAME}" >&2
+  if [[ "${#FINAL_CMD[@]}" -eq 0 ]]; then
+    printf '[%s]   - %s\n' "${SCRIPT_NAME}" "${DEFAULT_SHELL}" >&2
+  else
+    for item in "${FINAL_CMD[@]-}"; do
+      [[ -n "${item}" ]] || continue
+      printf '[%s]   - %s\n' "${SCRIPT_NAME}" "${item}" >&2
+    done
+  fi
+}
+
+print_args() {
+  local arg
+  printf '[%s] Final sandbox-exec command:\n' "${SCRIPT_NAME}" >&2
+  for arg in "$@"; do
+    printf ' %q' "${arg}" >&2
+  done
+  printf '\n' >&2
+}
+
+sb_escape() {
+  local s="$1"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "${s}"
+}
+
+build_shell_payload() {
+  local payload=""
+  local cmd
+  local env_name
+  local kv
+
+  payload+=$'set -Eeuo pipefail\n'
+  payload+=$'cd "$PWD"\n'
+
+  for env_name in "${UNSET_ENVS[@]-}"; do
+    [[ -n "${env_name}" ]] || continue
+    payload+="unset -v ${env_name} 2>/dev/null || true"$'\n'
+  done
+
+  for kv in "${EXTRA_ENVS[@]-}"; do
+    [[ -n "${kv}" ]] || continue
+    payload+="export ${kv}"$'\n'
+  done
+
+  if [[ "${DISABLE_HISTORY}" -eq 1 ]]; then
+    payload+=$'export HISTFILE=/dev/null\n'
+    payload+=$'export HISTSIZE=0\n'
+    payload+=$'export SAVEHIST=0\n'
+  fi
+
+  for cmd in "${PRE_COMMANDS[@]-}"; do
+    [[ -n "${cmd}" ]] || continue
+    payload+="${cmd}"$'\n'
+  done
+
+  payload+=$'if [[ "$#" -eq 0 ]]; then\n'
+  payload+=$'  mkdir -p "${SANDBOX_ZDOTDIR}"\n'
+  payload+=$'  cat > "${SANDBOX_ZDOTDIR}/.zshrc" <<'\''EOF_SANDBOX_ZSHRC'\'''$'\n'
+  payload+=$'export SANDBOX_INTERACTIVE=1\n'
+  payload+=$'export SANDBOX_SOURCE_ZSHRC="${SANDBOX_SOURCE_ZSHRC}"\n'
+  payload+=$'mkdir -p "${XDG_CACHE_HOME}" "${XDG_STATE_HOME}" "${ZSH_CACHE_DIR}"\n'
+  payload+=$'[[ -n "${ZSH_COMPDUMP:-}" ]] && mkdir -p "${ZSH_COMPDUMP%/*}"\n'
+  payload+=$'unsetopt monitor 2>/dev/null || true\n'
+  payload+=$'unsetopt prompt_subst 2>/dev/null || true\n'
+  payload+=$'[[ -r /etc/zshrc ]] && source /etc/zshrc || true\n'
+  payload+=$'[[ -r "${SANDBOX_SOURCE_ZSHRC}" ]] && source "${SANDBOX_SOURCE_ZSHRC}" || true\n'
+  payload+=$'_sandbox_apply_prompt() {\n'
+  payload+=$'  local prefix="${SANDBOX_PROMPT_PREFIX:-"(sandbox)"}"\n'
+  payload+=$'  local prompt_core="${PROMPT:-${PS1:-%n@%m:%~%# }}"\n'
+  payload+=$'  prompt_core="${prompt_core#${prefix} }"\n'
+  payload+=$'  PROMPT="${prefix} ${prompt_core}"\n'
+  payload+=$'}\n'
+  payload+=$'_sandbox_apply_prompt\n'
+  payload+=$'precmd_functions=(${precmd_functions:#_sandbox_apply_prompt})\n'
+  payload+=$'precmd_functions+=(_sandbox_apply_prompt)\n'
+  payload+=$'EOF_SANDBOX_ZSHRC\n'
+  payload+=$'  export ZDOTDIR="${SANDBOX_ZDOTDIR}"\n'
+  payload+=$'  exec zsh -i\n'
+  payload+=$'else\n'
+  payload+=$'  exec "$@"\n'
+  payload+=$'fi\n'
+
+  printf '%s' "${payload}"
+}
+
+build_profile() {
+  local profile_path="$1"
+  local path
+
+  {
+    printf '%s\n' '(version 1)'
+    printf '%s\n' '(deny default)'
+    printf '\n'
+    printf '%s\n' ';; Base system policy'
+    printf '%s\n' '(import "system.sb")'
+    printf '\n'
+    printf '%s\n' ';; Process control'
+    printf '%s\n' '(allow process-exec)'
+    printf '%s\n' '(allow process-fork)'
+    printf '%s\n' '(allow signal (target self))'
+    printf '%s\n' '(allow pseudo-tty)'
+    printf '\n'
+    printf '%s\n' ';; Match Linux script usage logic: broadly readable filesystem'
+    printf '%s\n' '(allow file-read*)'
+    printf '%s\n' '(allow file-read-metadata)'
+    printf '\n'
+    printf '%s\n' ';; Writable paths'
+    printf '%s\n' '(allow file-ioctl)'
+    printf '%s\n' '(allow file-write-data (literal "/dev/null"))'
+    printf '%s\n' '(allow file-write-data (literal "/dev/tty"))'
+    printf '%s\n' '(allow file-write-data (literal "/dev/stdout"))'
+    printf '%s\n' '(allow file-write-data (literal "/dev/stderr"))'
+    printf '%s\n' '(allow file-write* (subpath "/private/tmp"))'
+    printf '%s\n' '(allow file-write* (subpath "/private/var/tmp"))'
+
+    for path in "${RW_MOUNTS[@]-}"; do
+      [[ -n "${path}" ]] || continue
+      printf '(allow file-write* (subpath "%s"))\n' "$(sb_escape "${path}")"
+    done
+
+    printf '\n'
+    if [[ "${ENABLE_NET}" -eq 1 ]]; then
+      printf '%s\n' ';; Network'
+      printf '%s\n' '(allow network*)'
+    fi
+  } > "${profile_path}"
+}
+
+################################################################################
+# Main flow
+################################################################################
+
+require_cmd sandbox-exec
+require_cmd zsh
+require_cmd awk
+
+validate_toggle "ENABLE_NET"            "${ENABLE_NET}"
+validate_toggle "STRICT_MOUNTS"         "${STRICT_MOUNTS}"
+validate_toggle "AUTO_MOUNT_CWD"        "${AUTO_MOUNT_CWD}"
+validate_toggle "PRINT_CONFIG_SUMMARY"  "${PRINT_CONFIG_SUMMARY}"
+validate_toggle "DEBUG_PRINT_FINAL_CMD" "${DEBUG_PRINT_FINAL_CMD}"
+validate_toggle "DISABLE_HISTORY"       "${DISABLE_HISTORY}"
+validate_toggle "DISABLE_OH_MY_ZSH_IN_SANDBOX" "${DISABLE_OH_MY_ZSH_IN_SANDBOX}"
+
+validate_abs_list "RO_MOUNTS"
+validate_abs_list "RW_MOUNTS"
+validate_abs_list "FORBIDDEN_CWD_EXACT"
+validate_abs_list "FORBIDDEN_CWD_PREFIXES"
+validate_abs_list "ALLOWED_RW_PREFIXES"
+validate_env_lists
+validate_pre_commands
+
+normalize_array_paths "RO_MOUNTS"
+normalize_array_paths "RW_MOUNTS"
+normalize_array_paths "FORBIDDEN_CWD_EXACT"
+normalize_array_paths "FORBIDDEN_CWD_PREFIXES"
+normalize_array_paths "ALLOWED_RW_PREFIXES"
+
+dedup_array "RO_MOUNTS"
+dedup_array "RW_MOUNTS"
+dedup_array "FORBIDDEN_CWD_EXACT"
+dedup_array "FORBIDDEN_CWD_PREFIXES"
+dedup_array "ALLOWED_RW_PREFIXES"
+
+CWD_REAL="$(pwd_real)"
+validate_cwd_rules "${CWD_REAL}"
+
+if [[ "${AUTO_MOUNT_CWD}" -eq 1 ]]; then
+  RW_MOUNTS+=("${CWD_REAL}")
+fi
+
+FINAL_CMD=()
+if [[ "$#" -gt 0 ]]; then
+  FINAL_CMD=("$@")
+fi
+
+HOST_SANDBOX_LEVEL_RAW="${SANDBOX_LEVEL:-0}"
+if [[ "${HOST_SANDBOX_LEVEL_RAW}" =~ ^[0-9]+$ ]]; then
+  NEXT_SANDBOX_LEVEL=$((HOST_SANDBOX_LEVEL_RAW + 1))
+else
+  NEXT_SANDBOX_LEVEL=1
+fi
+
+SANDBOX_PROMPT_PREFIX="$(build_prompt_prefix "${NEXT_SANDBOX_LEVEL}")"
+SANDBOX_RUNTIME_DIR="/tmp/.sandbox-runtime-${UID:-$(id -u)}-$$"
+SANDBOX_ZDOTDIR="${SANDBOX_RUNTIME_DIR}/zdotdir"
+SANDBOX_PROFILE="${SANDBOX_RUNTIME_DIR}/profile.sb"
+
+mkdir -p "${SANDBOX_RUNTIME_DIR}"
+trap 'rm -rf "${SANDBOX_RUNTIME_DIR}"' EXIT
+
+SANDBOX_SOURCE_ZSHRC="${HOME}/.zshrc"
+if [[ "${DISABLE_OH_MY_ZSH_IN_SANDBOX}" -eq 1 && -r "${HOME}/.zshrc" ]]; then
+  SANDBOX_SOURCE_ZSHRC="${SANDBOX_RUNTIME_DIR}/.zshrc.user"
+  awk '
+    BEGIN { skip_p10k=0 }
+    /p10k-instant-prompt/ { skip_p10k=1; next }
+    skip_p10k && /^fi$/ { skip_p10k=0; next }
+    skip_p10k { next }
+    /^[[:space:]]*export ZSH=.*\.oh-my-zsh/ { next }
+    /^[[:space:]]*plugins=\(/ { next }
+    /^[[:space:]]*source[[:space:]]+\$ZSH\/oh-my-zsh\.sh/ { next }
+    /source \$ZSH\/oh-my-zsh\.sh/ { next }
+    /\.oh-my-zsh\/oh-my-zsh\.sh/ { next }
+    /powerlevel10k\.zsh-theme/ { next }
+    /source ~\/\.p10k\.zsh/ { next }
+    /\[\[ ! -f ~\/\.p10k\.zsh \]\] \|\| source ~\/\.p10k\.zsh/ { next }
+    /POWERLEVEL9K_INSTANT_PROMPT/ { next }
+    /^[[:space:]]*ZSH_THEME=.*$/ { next }
+    { print }
+  ' "${HOME}/.zshrc" > "${SANDBOX_SOURCE_ZSHRC}"
+fi
+
+SANDBOX_XDG_CACHE_HOME="${SANDBOX_RUNTIME_DIR}/xdg-cache"
+SANDBOX_XDG_STATE_HOME="${SANDBOX_RUNTIME_DIR}/xdg-state"
+SANDBOX_ZSH_CACHE_DIR="${SANDBOX_XDG_CACHE_HOME}/zsh"
+SANDBOX_ZSH_COMPDUMP="${SANDBOX_ZSH_CACHE_DIR}/.zcompdump"
+
+mkdir -p \
+  "${SANDBOX_XDG_CACHE_HOME}" \
+  "${SANDBOX_XDG_STATE_HOME}" \
+  "${SANDBOX_ZSH_CACHE_DIR}" \
+  "${SANDBOX_ZSH_COMPDUMP%/*}"
+
+RW_MOUNTS+=(
+  "${SANDBOX_XDG_CACHE_HOME}"
+  "${SANDBOX_XDG_STATE_HOME}"
+  "${SANDBOX_ZSH_CACHE_DIR}"
+)
+
+normalize_array_paths "RW_MOUNTS"
+dedup_array "RW_MOUNTS"
+validate_rw_mount_rules
+warn_mount_conflicts
+
+if [[ "${STRICT_MOUNTS}" -eq 1 ]]; then
+  for path in "${RO_MOUNTS[@]-}" "${RW_MOUNTS[@]-}"; do
+    [[ -n "${path}" ]] || continue
+    path_exists_any "${path}" || die "configured path does not exist: ${path}"
+  done
+else
+  FILTERED_RO=()
+  FILTERED_RW=()
+
+  for path in "${RO_MOUNTS[@]-}"; do
+    [[ -n "${path}" ]] || continue
+    if path_exists_any "${path}"; then
+      FILTERED_RO+=("${path}")
+    else
+      warn "RO path skipped because it does not exist: ${path}"
+    fi
+  done
+
+  for path in "${RW_MOUNTS[@]-}"; do
+    [[ -n "${path}" ]] || continue
+    if path_exists_any "${path}"; then
+      FILTERED_RW+=("${path}")
+    else
+      warn "RW path skipped because it does not exist: ${path}"
+    fi
+  done
+
+  RO_MOUNTS=("${FILTERED_RO[@]-}")
+  RW_MOUNTS=("${FILTERED_RW[@]-}")
+fi
+
+if [[ "${PRINT_CONFIG_SUMMARY}" -eq 1 ]]; then
+  print_summary "$@"
+fi
+
+build_profile "${SANDBOX_PROFILE}"
+SHELL_PAYLOAD="$(build_shell_payload)"
+
+EXEC_CMD=()
+if [[ "${#FINAL_CMD[@]}" -gt 0 ]]; then
+  EXEC_CMD=("${FINAL_CMD[@]}")
+else
+  EXEC_CMD=("zsh" "-lc" "${SHELL_PAYLOAD}" "zsh")
+fi
+
+SANDBOX_ENV_ARGS=(
+  "PWD=${CWD_REAL}"
+  "SHELL=$(command -v zsh)"
+  "SANDBOX_ACTIVE=1"
+  "SANDBOX_LEVEL=${NEXT_SANDBOX_LEVEL}"
+  "SANDBOX_PROMPT_PREFIX=${SANDBOX_PROMPT_PREFIX}"
+  "SANDBOX_RUNTIME_DIR=${SANDBOX_RUNTIME_DIR}"
+  "SANDBOX_ZDOTDIR=${SANDBOX_ZDOTDIR}"
+  "SANDBOX_SOURCE_ZSHRC=${SANDBOX_SOURCE_ZSHRC}"
+  "XDG_CACHE_HOME=${SANDBOX_XDG_CACHE_HOME}"
+  "XDG_STATE_HOME=${SANDBOX_XDG_STATE_HOME}"
+  "ZSH_CACHE_DIR=${SANDBOX_ZSH_CACHE_DIR}"
+  "ZSH_COMPDUMP=${SANDBOX_ZSH_COMPDUMP}"
+  "SANDBOX_INTERACTIVE=1"
+)
+
+SANDBOX_CMD=(
+  sandbox-exec
+  -f "${SANDBOX_PROFILE}"
+  env
+  "${SANDBOX_ENV_ARGS[@]}"
+  "${EXEC_CMD[@]-}"
+)
+
+if [[ "${DEBUG_PRINT_FINAL_CMD}" -eq 1 ]]; then
+  print_args "${SANDBOX_CMD[@]-}"
+fi
+
+cd "${CWD_REAL}"
+exec "${SANDBOX_CMD[@]-}"
