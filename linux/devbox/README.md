@@ -164,16 +164,25 @@ It does the following:
 
 - Verifies that a local SSH public key exists
 - Appends that public key to both the container user's and `root`'s `authorized_keys`
-- Writes exported environment variables to `/etc/profile.d/devbox_env.sh`
+- Writes proxy helper functions to `/etc/profile.d/devbox_env.sh`
 - Copies configured files and directories into the container
 - Runs configured deploy commands inside the container
 - Restarts `sshd`
 
 The deploy behavior is configured near the top of the `devbox` script:
 
-- `DEPLOY_ENV_VARS`
+- `PROXY_ENV_VARS`
 - `DEPLOY_SYNC_FILES`
 - `DEPLOY_COMMANDS`
+
+The generated profile script defines two shell functions:
+
+- `proxy_on`: exports proxy variables inherited from the host environment
+- `proxy_off`: unsets those proxy variables again
+
+`proxy_on` is executed by default when the profile is sourced.
+
+If the host has no proxy variables set, both functions still exist but `proxy_on` becomes a no-op.
 
 Example pattern:
 
