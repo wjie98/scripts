@@ -7,25 +7,38 @@ RUN apt-get update && \
       apt-utils \
       bash \
       bash-completion \
+      build-essential \
       ca-certificates \
+      cmake \
       curl \
-      gcc \
+      dnsutils \
+      fd-find \
+      file \
       git \
+      git-lfs \
       htop \
+      jq \
+      lsof \
       net-tools \
-      vim \
       less \
-      tmux \
-      sudo \
-      procps \
-      psmisc \
+      patch \
       iproute2 \
       iputils-ping \
       openssh-server \
+      procps \
+      psmisc \
       python3 \
       python3-pip \
+      python3-venv \
+      ripgrep \
+      rsync \
+      strace \
+      sudo \
       supervisor \
+      tmux \
       tini && \
+      git lfs install --system && \
+      ln -sf /usr/bin/fdfind /usr/local/bin/fd && \
     rm -rf /var/lib/apt/lists/*
 
 # Prepare runtime directories

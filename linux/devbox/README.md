@@ -281,9 +281,11 @@ PORT_RANGE_START=30000 PORT_RANGE_END=30999 bash ./devbox run mybox
 The bundled `Dockerfile` creates an Ubuntu 24.04 image with common development tools and an SSH server. It includes packages such as:
 
 - `apt-utils`
-- `bash`, `git`, `vim`, `tmux`, `htop`
-- `curl`, `iproute2`, `net-tools`, `iputils-ping`
-- `python3`, `python3-pip`, `gcc`
+- `bash`, `git`, `git-lfs`, `tmux`, `htop`, `less`
+- `build-essential`, `cmake`, `patch`, `file`
+- `curl`, `iproute2`, `iputils-ping`, `net-tools`, `dnsutils`, `lsof`, `strace`
+- `ripgrep`, `fd`, `jq`, `rsync`
+- `python3`, `python3-pip`, `python3-venv`
 - `openssh-server`, `supervisor`, `tini`, `sudo`
 
 Container startup is handled by `devbox-init.sh`.
