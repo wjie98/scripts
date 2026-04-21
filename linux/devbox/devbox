@@ -85,10 +85,6 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
-shell_quote() {
-  printf '%q' "$1"
-}
-
 is_macos() {
   [ "$(uname -s 2>/dev/null || printf unknown)" = "Darwin" ]
 }
@@ -213,7 +209,7 @@ write_proxy_helper_script() {
       eval "value=\${$var-}"
       if [ -n "${value:-}" ]; then
         has_proxy="yes"
-        printf '    export %s=%s\n' "$var" "$(shell_quote "$value")"
+        printf '    export %s=%s\n' "$var" "$(printf '%q' "$value")"
       fi
     done
 
@@ -607,22 +603,41 @@ get_container_config_env() {
   fi
 }
 
+get_container_runtime_user_env() {
+  local container="$1"
+  local env_name="$2"
+
+  if container_is_running "$container"; then
+    runtime exec "$container" env ENV_NAME="$env_name" sh -lc '
+if [ -f /etc/devbox/user.env ]; then
+  . /etc/devbox/user.env
+  eval "value=\${${ENV_NAME}:-}"
+  if [ -n "${value:-}" ]; then
+    printf "%s\n" "${value}"
+  fi
+fi
+' 2>/dev/null || true
+  fi
+}
+
+get_container_env_value() {
+  local container="$1"
+  local env_name="$2"
+  local value
+
+  value=$(get_container_config_env "$container" "$env_name")
+  if [ -z "$value" ]; then
+    value=$(get_container_runtime_user_env "$container" "$env_name")
+  fi
+
+  printf '%s\n' "$value"
+}
+
 get_container_dev_user() {
   local container="$1"
   local user_name
 
-  user_name=$(get_container_config_env "$container" "DEVBOX_USER")
-
-  if [ -z "$user_name" ] && container_is_running "$container"; then
-    user_name=$(runtime exec "$container" sh -lc '
-if [ -f /etc/devbox/user.env ]; then
-  . /etc/devbox/user.env
-  if [ -n "${DEVBOX_USER:-}" ]; then
-    printf "%s\n" "${DEVBOX_USER}"
-  fi
-fi
-' 2>/dev/null || true)
-  fi
+  user_name=$(get_container_env_value "$container" "DEVBOX_USER")
 
   [ -n "$user_name" ] || user_name="root"
   printf '%s\n' "$user_name"
@@ -632,18 +647,7 @@ get_container_dev_group() {
   local container="$1"
   local group_name
 
-  group_name=$(get_container_config_env "$container" "DEVBOX_GROUP")
-
-  if [ -z "$group_name" ] && container_is_running "$container"; then
-    group_name=$(runtime exec "$container" sh -lc '
-if [ -f /etc/devbox/user.env ]; then
-  . /etc/devbox/user.env
-  if [ -n "${DEVBOX_GROUP:-}" ]; then
-    printf "%s\n" "${DEVBOX_GROUP}"
-  fi
-fi
-' 2>/dev/null || true)
-  fi
+  group_name=$(get_container_env_value "$container" "DEVBOX_GROUP")
 
   [ -n "$group_name" ] || group_name="root"
   printf '%s\n' "$group_name"
@@ -654,19 +658,10 @@ get_container_dev_home() {
   local user_name="$2"
   local user_home
 
-  user_home=$(get_container_config_env "$container" "DEVBOX_HOME")
+  user_home=$(get_container_env_value "$container" "DEVBOX_HOME")
 
   if [ -z "$user_home" ] && container_is_running "$container"; then
-    user_home=$(runtime exec "$container" sh -lc '
-if [ -f /etc/devbox/user.env ]; then
-  . /etc/devbox/user.env
-  if [ -n "${DEVBOX_HOME:-}" ] && [ "${DEVBOX_USER:-}" = "'"$(printf '%s' "$user_name")"'" ]; then
-    printf "%s\n" "${DEVBOX_HOME}"
-    exit 0
-  fi
-fi
-getent passwd "'"$(printf '%s' "$user_name")"'" | cut -d: -f6
-' 2>/dev/null || true)
+    user_home=$(runtime exec "$container" getent passwd "$user_name" 2>/dev/null | cut -d: -f6 || true)
   fi
 
   if [ -z "$user_home" ] && [ "$user_name" = "root" ]; then
@@ -817,12 +812,7 @@ deploy_local_container() {
 
   ensure_local_ssh_key
 
-  container_exists "$container" || die "Container does not exist: $container"
-
-  if ! container_is_running "$container"; then
-    info "Container is not running. Starting it first."
-    runtime start "$container" >/dev/null || die "Failed to start container: $container"
-  fi
+  ensure_container_running "$container" "deploying the environment"
 
   append_pubkey_to_container "$container"
   sync_env_to_container "$container"
