@@ -3,7 +3,7 @@
 set -u
 
 CONTAINER_CMD="${CONTAINER_CMD:-docker}"
-IMAGE_NAME="${IMAGE_NAME:-devops-ubuntu:24.04}"
+IMAGE_NAME="${IMAGE_NAME:-devbox-ubuntu:24.04}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-.}"
 

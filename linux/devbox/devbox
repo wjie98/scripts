@@ -8,10 +8,10 @@
 CONTAINER_CMD="${CONTAINER_CMD:-docker}"
 
 # Shared container name prefix
-CONTAINER_PREFIX="${CONTAINER_PREFIX:-devops-}"
+CONTAINER_PREFIX="${CONTAINER_PREFIX:-devbox-}"
 
 # Image prefix for interactive selection
-IMAGE_PREFIX="${IMAGE_PREFIX:-devops-}"
+IMAGE_PREFIX="${IMAGE_PREFIX:-devbox-}"
 
 # Workspace path inside container
 CONTAINER_WORKDIR="${CONTAINER_WORKDIR:-/workspace}"
@@ -262,13 +262,38 @@ get_container_created_at() {
 
 get_container_dev_uid_gid() {
   local container="$1"
+  local uid gid
 
-  runtime exec "$container" sh -lc '
+  uid=$(get_container_config_env "$container" "DEVBOX_UID")
+  gid=$(get_container_config_env "$container" "DEVBOX_GID")
+
+  if [ -n "$uid" ] && [ -n "$gid" ]; then
+    printf '%s:%s\n' "$uid" "$gid"
+    return 0
+  fi
+
+  if container_is_running "$container"; then
+    runtime exec "$container" sh -lc '
 if [ -f /etc/devbox/user.env ]; then
   . /etc/devbox/user.env
   printf "%s:%s\n" "${DEVBOX_UID:-}" "${DEVBOX_GID:-}"
 fi
 ' 2>/dev/null || true
+  fi
+}
+
+ensure_container_running() {
+  local container="$1"
+  local action_desc="$2"
+
+  container_exists "$container" || die "Container does not exist: $container"
+
+  if container_is_running "$container"; then
+    return 0
+  fi
+
+  info "Container is not running. Starting it before ${action_desc}."
+  runtime start "$container" >/dev/null || die "Failed to start container: $container"
 }
 
 get_container_workdir() {
@@ -536,11 +561,27 @@ stop_remote_connection_mux() {
   ssh -o ControlPath="$control_path" -p "$port" -O exit "$target" >/dev/null 2>&1 || true
 }
 
+get_container_config_env() {
+  local container="$1"
+  local env_name="$2"
+  local env_line
+
+  env_line=$(runtime inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container" 2>/dev/null \
+    | grep -m1 "^${env_name}=" || true)
+
+  if [ -n "$env_line" ]; then
+    printf '%s\n' "${env_line#*=}"
+  fi
+}
+
 get_container_dev_user() {
   local container="$1"
   local user_name
 
-  user_name=$(runtime exec "$container" sh -lc '
+  user_name=$(get_container_config_env "$container" "DEVBOX_USER")
+
+  if [ -z "$user_name" ] && container_is_running "$container"; then
+    user_name=$(runtime exec "$container" sh -lc '
 if [ -f /etc/devbox/user.env ]; then
   . /etc/devbox/user.env
   if [ -n "${DEVBOX_USER:-}" ]; then
@@ -548,6 +589,7 @@ if [ -f /etc/devbox/user.env ]; then
   fi
 fi
 ' 2>/dev/null || true)
+  fi
 
   [ -n "$user_name" ] || user_name="root"
   printf '%s\n' "$user_name"
@@ -557,7 +599,10 @@ get_container_dev_group() {
   local container="$1"
   local group_name
 
-  group_name=$(runtime exec "$container" sh -lc '
+  group_name=$(get_container_config_env "$container" "DEVBOX_GROUP")
+
+  if [ -z "$group_name" ] && container_is_running "$container"; then
+    group_name=$(runtime exec "$container" sh -lc '
 if [ -f /etc/devbox/user.env ]; then
   . /etc/devbox/user.env
   if [ -n "${DEVBOX_GROUP:-}" ]; then
@@ -565,6 +610,7 @@ if [ -f /etc/devbox/user.env ]; then
   fi
 fi
 ' 2>/dev/null || true)
+  fi
 
   [ -n "$group_name" ] || group_name="root"
   printf '%s\n' "$group_name"
@@ -575,7 +621,10 @@ get_container_dev_home() {
   local user_name="$2"
   local user_home
 
-  user_home=$(runtime exec "$container" sh -lc '
+  user_home=$(get_container_config_env "$container" "DEVBOX_HOME")
+
+  if [ -z "$user_home" ] && container_is_running "$container"; then
+    user_home=$(runtime exec "$container" sh -lc '
 if [ -f /etc/devbox/user.env ]; then
   . /etc/devbox/user.env
   if [ -n "${DEVBOX_HOME:-}" ] && [ "${DEVBOX_USER:-}" = "'"$(printf '%s' "$user_name")"'" ]; then
@@ -585,6 +634,11 @@ if [ -f /etc/devbox/user.env ]; then
 fi
 getent passwd "'"$(printf '%s' "$user_name")"'" | cut -d: -f6
 ' 2>/dev/null || true)
+  fi
+
+  if [ -z "$user_home" ] && [ "$user_name" = "root" ]; then
+    user_home="/root"
+  fi
 
   printf '%s\n' "$user_home"
 }
@@ -1037,9 +1091,7 @@ enter_container() {
   local container
   container=$(resolve_container_name "${1:-}")
 
-  if ! container_is_running "$container"; then
-    die "Container is not running: $container"
-  fi
+  ensure_container_running "$container" "opening a shell"
 
   info "Opening maintenance shell: $container"
   info "Login user: root"
@@ -1058,9 +1110,7 @@ ssh_container() {
   command_exists ssh || die "ssh command not found."
   container=$(resolve_container_name "${1:-}")
 
-  if ! container_is_running "$container"; then
-    die "Container is not running: $container"
-  fi
+  ensure_container_running "$container" "connecting over SSH"
 
   append_pubkey_to_container "$container"
   restart_sshd_in_container "$container"
@@ -1132,6 +1182,20 @@ inspect_container() {
   printf 'Mount: %s -> %s\n' "$mount_source" "$CONTAINER_WORKDIR"
   printf 'Created At: %s\n' "$created_at"
   printf 'Port Bindings:\n%s\n' "$port_bindings"
+
+  if [ "$status" != "running" ]; then
+    printf 'Notes:\n'
+
+    if [ "$ssh_port" = "-" ]; then
+      printf -- '- SSH port is shown only when the container is running and the runtime reports an active mapping.\n'
+    fi
+
+    if [ "$port_bindings" = "-" ]; then
+      printf -- '- Port binding details may be unavailable until the container is started.\n'
+    fi
+
+    printf -- '- This command does not start the container. Status is reported as-is.\n'
+  fi
 }
 
 usage() {

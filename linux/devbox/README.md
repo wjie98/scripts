@@ -26,7 +26,7 @@ Build the bundled image:
 bash ./build-image.sh
 ```
 
-Create a container from an image whose name starts with `devops-`:
+Create a container from an image whose name starts with `devbox-`:
 
 ```bash
 bash ./devbox run
@@ -208,7 +208,7 @@ If both key-based and password-based login fail, the script exits and suggests a
 The bundled image helper builds this image by default:
 
 ```text
-devops-ubuntu:24.04
+devbox-ubuntu:24.04
 ```
 
 Build it with:
@@ -234,8 +234,8 @@ The script checks whether the image already exists.
 Important defaults from `devbox`:
 
 - `CONTAINER_CMD=docker`
-- `CONTAINER_PREFIX=devops-`
-- `IMAGE_PREFIX=devops-`
+- `CONTAINER_PREFIX=devbox-`
+- `IMAGE_PREFIX=devbox-`
 - `CONTAINER_WORKDIR=/workspace`
 - `PREFERRED_SHELL=bash`
 - `DEFAULT_GPU_ENABLE=yes`
@@ -307,7 +307,7 @@ Install Docker or Podman, or set `CONTAINER_CMD` correctly.
 ## Notes
 
 - Container names are normalized with `CONTAINER_PREFIX`.
-- Short names like `mybox` become `devops-mybox` by default.
+- Short names like `mybox` become `devbox-mybox` by default.
 - `ssh` always targets the configured development user, not `root`.
 - `shell` always opens as `root`.
 - The helper is intentionally interactive. It is optimized for operator-driven local usage rather than unattended automation.
