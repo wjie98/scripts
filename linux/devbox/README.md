@@ -175,6 +175,22 @@ The deploy behavior is configured near the top of the `devbox` script:
 - `DEPLOY_SYNC_FILES`
 - `DEPLOY_COMMANDS`
 
+`DEPLOY_SYNC_FILES` still uses the `source_path:target_path` format, but `target_path` now supports a few runtime placeholders:
+
+- `{{DEVBOX_HOME}}`: the resolved home directory of the container development user
+- `{{DEVBOX_USER}}`: the resolved development user name
+- `{{CONTAINER_WORKDIR}}`: the configured container workdir, `/workspace` by default
+
+Example:
+
+```bash
+DEPLOY_SYNC_FILES=(
+  "$HOME/.gitconfig:{{DEVBOX_HOME}}/.gitconfig"
+  "$HOME/.ssh/config:{{DEVBOX_HOME}}/.ssh/config"
+  "$HOME/project.env:{{CONTAINER_WORKDIR}}/.env"
+)
+```
+
 The generated profile script defines two shell functions:
 
 - `proxy_on`: exports proxy variables inherited from the host environment

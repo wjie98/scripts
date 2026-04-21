@@ -43,9 +43,11 @@ PROXY_ENV_VARS=(
 
 # Files or directories to sync during deploy
 # Format: "source_path:target_path"
+# Supported target placeholders: {{DEVBOX_HOME}}, {{DEVBOX_USER}}, {{CONTAINER_WORKDIR}}
 DEPLOY_SYNC_FILES=(
-  # "$HOME/.gitconfig:/root/.gitconfig"
-  # "$HOME/.ssh/config:/root/.ssh/config"
+  # "$HOME/.gitconfig:{{DEVBOX_HOME}}/.gitconfig"
+  # "$HOME/.ssh/config:{{DEVBOX_HOME}}/.ssh/config"
+  # "$HOME/project.env:{{CONTAINER_WORKDIR}}/.env"
 )
 
 # Commands to run during deploy
@@ -224,6 +226,19 @@ write_proxy_helper_script() {
     printf '}\n\n'
     printf 'proxy_on\n'
   } > "$output_file"
+}
+
+expand_deploy_target_path() {
+  local template="$1"
+  local dev_user="$2"
+  local dev_home="$3"
+  local expanded="$template"
+
+  expanded=${expanded//\{\{DEVBOX_USER\}\}/$dev_user}
+  expanded=${expanded//\{\{DEVBOX_HOME\}\}/$dev_home}
+  expanded=${expanded//\{\{CONTAINER_WORKDIR\}\}/$CONTAINER_WORKDIR}
+
+  printf '%s\n' "$expanded"
 }
 
 normalize_container_name() {
@@ -782,17 +797,22 @@ sync_env_to_container() {
 
 sync_files_to_container() {
   local container="$1"
-  local mapping src dst resolved_src
+  local mapping src dst resolved_src expanded_dst dev_user dev_home
+
+  dev_user=$(get_container_dev_user "$container")
+  dev_home=$(get_container_dev_home "$container" "$dev_user")
+  [ -n "$dev_home" ] || die "Failed to resolve home directory for container user: $dev_user"
 
   for mapping in "${DEPLOY_SYNC_FILES[@]-}"; do
     src=${mapping%%:*}
     dst=${mapping#*:}
     eval "resolved_src=$src"
+    expanded_dst=$(expand_deploy_target_path "$dst" "$dev_user" "$dev_home")
     [ -n "$resolved_src" ] || continue
-    [ -n "$dst" ] || continue
+    [ -n "$expanded_dst" ] || continue
     [ -e "$resolved_src" ] || { warn "Skip missing path: $resolved_src"; continue; }
-    info "Copying to container: $resolved_src -> $dst"
-    copy_to_container "$resolved_src" "$container" "$dst"
+    info "Copying to container: $resolved_src -> $expanded_dst"
+    copy_to_container "$resolved_src" "$container" "$expanded_dst"
   done
 }
 
@@ -862,17 +882,25 @@ sync_env_to_remote() {
 sync_files_to_remote() {
   local target="$1"
   local port="$2"
-  local mapping src dst resolved_src
+  local mapping src dst resolved_src expanded_dst remote_user remote_home
+
+  remote_user=$(remote_user_name "$target")
+  if [ "$remote_user" = "root" ]; then
+    remote_home="/root"
+  else
+    remote_home="/home/${remote_user}"
+  fi
 
   for mapping in "${DEPLOY_SYNC_FILES[@]-}"; do
     src=${mapping%%:*}
     dst=${mapping#*:}
     eval "resolved_src=$src"
+    expanded_dst=$(expand_deploy_target_path "$dst" "$remote_user" "$remote_home")
     [ -n "$resolved_src" ] || continue
-    [ -n "$dst" ] || continue
+    [ -n "$expanded_dst" ] || continue
     [ -e "$resolved_src" ] || { warn "Skip missing path: $resolved_src"; continue; }
-    info "Copying to remote: $resolved_src -> $dst"
-    remote_copy "$resolved_src" "$target" "$port" "$dst"
+    info "Copying to remote: $resolved_src -> $expanded_dst"
+    remote_copy "$resolved_src" "$target" "$port" "$expanded_dst"
   done
 }
 
@@ -1228,6 +1256,7 @@ Notes:
   - Shell opens a maintenance shell as root inside the container.
   - Ssh connects through the published container SSH port as the configured login user.
   - Deploy-remote works through SSH to the target user, tries password login only to install that user's public key, and does not touch root unless the target user is root.
+  - DEPLOY_SYNC_FILES target paths support: {{DEVBOX_HOME}}, {{DEVBOX_USER}}, {{CONTAINER_WORKDIR}}
   - Runtime default: ${CONTAINER_CMD}
   - Prefix default: ${CONTAINER_PREFIX}
 
