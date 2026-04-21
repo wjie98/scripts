@@ -139,7 +139,11 @@ When you create a container, `devbox` collects:
 
 The mounted project directory becomes the container working directory, which defaults to `/workspace`.
 
+The created container hostname is set to the normalized container name, so the in-container hostname matches what `devbox` manages on the host side.
+
 `devbox` refuses to mount your home directory directly. That guard exists to prevent broad and accidental host exposure.
+
+On macOS, `devbox` intentionally skips the GPU prompt even if Docker reports a `--gpus` flag. Docker Desktop may advertise the option while still rejecting actual GPU values for this workflow.
 
 ## Access Modes
 
@@ -251,6 +255,7 @@ PORT_RANGE_START=30000 PORT_RANGE_END=30999 bash ./devbox run mybox
 
 The bundled `Dockerfile` creates an Ubuntu 24.04 image with common development tools and an SSH server. It includes packages such as:
 
+- `apt-utils`
 - `bash`, `git`, `vim`, `tmux`, `htop`
 - `curl`, `iproute2`, `net-tools`, `iputils-ping`
 - `python3`, `python3-pip`, `gcc`
@@ -270,6 +275,8 @@ That script:
 ## GPU Support
 
 When the selected container runtime reports support for `--gpus`, `devbox run` offers to attach GPUs.
+
+On macOS, this prompt is skipped on purpose.
 
 Typical answers are:
 

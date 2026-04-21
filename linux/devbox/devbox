@@ -85,6 +85,10 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+is_macos() {
+  [ "$(uname -s 2>/dev/null || printf unknown)" = "Darwin" ]
+}
+
 ensure_runtime_available() {
   command_exists "$CONTAINER_CMD" || die "Container runtime not found: $CONTAINER_CMD"
 }
@@ -179,6 +183,17 @@ choose_from_list() {
         warn "Number out of range."
         ;;
     esac
+  done
+}
+
+read_lines_into_array() {
+  local array_name="$1"
+  local line
+
+  eval "$array_name=()"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    eval "$array_name+=(\"\$line\")"
   done
 }
 
@@ -282,6 +297,7 @@ list_prefixed_images() {
 resolve_container_name() {
   local raw="${1:-}"
   local containers selected
+  local container_list
 
   if [ -n "$raw" ]; then
     normalize_container_name "$raw"
@@ -291,27 +307,40 @@ resolve_container_name() {
   containers=$(list_prefixed_containers)
   [ -n "$containers" ] || die "No container found with prefix '${CONTAINER_PREFIX}'."
 
-  selected=$(choose_from_list "Available containers:" $(printf '%s\n' "$containers"))
+  read_lines_into_array container_list <<EOF
+$containers
+EOF
+
+  selected=$(choose_from_list "Available containers:" "${container_list[@]}")
   [ -n "$selected" ] || die "No container selected."
   printf '%s\n' "$selected"
 }
 
 choose_image_interactively() {
   local images selected
+  local image_list
   images=$(list_prefixed_images)
 
   [ -n "$images" ] || die "No local image found with prefix '${IMAGE_PREFIX}'. Build an image first."
 
-  selected=$(choose_from_list "Available images:" $(printf '%s\n' "$images"))
+  read_lines_into_array image_list <<EOF
+$images
+EOF
+
+  selected=$(choose_from_list "Available images:" "${image_list[@]}")
   [ -n "$selected" ] || die "No image selected."
   printf '%s\n' "$selected"
 }
 
 runtime_supports_gpus() {
+  if is_macos; then
+    return 1
+  fi
+
   runtime run --help 2>/dev/null | grep -q -- '--gpus'
 }
 
-collect_gpu_args() {
+collect_gpu_value() {
   local gpu_spec
 
   if ! runtime_supports_gpus; then
@@ -325,8 +354,8 @@ collect_gpu_args() {
   gpu_spec=$(prompt_input "Enter GPU spec ('all', GPU ids like '0,1', or 'none')" "all")
   case "$gpu_spec" in
     none|NONE|"") return 0 ;;
-    all) printf '%s\n' "--gpus all" ;;
-    *) printf '%s\n' "--gpus device=${gpu_spec}" ;;
+    all) printf '%s\n' "all" ;;
+    *) printf '%s\n' "device=${gpu_spec}" ;;
   esac
 }
 
@@ -454,14 +483,16 @@ remote_copy() {
   local target="$2"
   local port="$3"
   local dst="$4"
+  local remote_dst
 
   [ -e "$src" ] || die "Source path not found: $src"
   remote_exec "$target" "$port" "mkdir -p $(printf '%q' "$(dirname "$dst")")"
+  remote_dst="${target}:$(printf '%q' "$dst")"
 
   if [ -d "$src" ]; then
-    scp ${REMOTE_SCP_OPTS:-} -r -P "$port" "$src" "${target}:${dst}"
+    scp ${REMOTE_SCP_OPTS:-} -r -P "$port" "$src" "$remote_dst"
   else
-    scp ${REMOTE_SCP_OPTS:-} -P "$port" "$src" "${target}:${dst}"
+    scp ${REMOTE_SCP_OPTS:-} -P "$port" "$src" "$remote_dst"
   fi
 }
 
@@ -522,6 +553,23 @@ fi
   printf '%s\n' "$user_name"
 }
 
+get_container_dev_group() {
+  local container="$1"
+  local group_name
+
+  group_name=$(runtime exec "$container" sh -lc '
+if [ -f /etc/devbox/user.env ]; then
+  . /etc/devbox/user.env
+  if [ -n "${DEVBOX_GROUP:-}" ]; then
+    printf "%s\n" "${DEVBOX_GROUP}"
+  fi
+fi
+' 2>/dev/null || true)
+
+  [ -n "$group_name" ] || group_name="root"
+  printf '%s\n' "$group_name"
+}
+
 get_container_dev_home() {
   local container="$1"
   local user_name="$2"
@@ -579,14 +627,16 @@ print_container_list_row() {
 
 append_pubkey_to_container() {
   local container="$1"
-  local pubkey_file dev_user dev_home tmpdir tmpfile escaped_home escaped_user
+  local pubkey_file dev_user dev_group dev_home tmpdir tmpfile escaped_home escaped_user escaped_group
 
   pubkey_file=$(find_default_pubkey) || die "No SSH public key found."
   dev_user=$(get_container_dev_user "$container")
+  dev_group=$(get_container_dev_group "$container")
   dev_home=$(get_container_dev_home "$container" "$dev_user")
   [ -n "$dev_home" ] || die "Failed to resolve home directory for container user: $dev_user"
   escaped_home=$(printf '%q' "$dev_home")
   escaped_user=$(printf '%q' "$dev_user")
+  escaped_group=$(printf '%q' "$dev_group")
 
   tmpdir=$(mktemp -d) || die "Failed to create temporary directory."
   tmpfile="${tmpdir}/authorized_keys"
@@ -610,7 +660,7 @@ touch ${escaped_home}/.ssh/authorized_keys
 chmod 600 ${escaped_home}/.ssh/authorized_keys
 grep -qxF -f /tmp/devbox_authorized_key ${escaped_home}/.ssh/authorized_keys || cat /tmp/devbox_authorized_key >> ${escaped_home}/.ssh/authorized_keys
 rm -f /tmp/devbox_authorized_key
-chown -R ${escaped_user}:${escaped_user} ${escaped_home}/.ssh || true
+chown -R ${escaped_user}:${escaped_group} ${escaped_home}/.ssh || true
 "
 
   rm -rf "$tmpdir"
@@ -644,7 +694,7 @@ sync_env_to_container() {
   tmpfile=$(mktemp) || die "Failed to create temporary file."
   {
     printf '# Generated by devbox deploy\n'
-    for var in "${DEPLOY_ENV_VARS[@]}"; do
+    for var in "${DEPLOY_ENV_VARS[@]-}"; do
       eval "value=\${$var-}"
       if [ -n "${value:-}" ]; then
         printf 'export %s=%q\n' "$var" "$value"
@@ -660,7 +710,7 @@ sync_files_to_container() {
   local container="$1"
   local mapping src dst resolved_src
 
-  for mapping in "${DEPLOY_SYNC_FILES[@]}"; do
+  for mapping in "${DEPLOY_SYNC_FILES[@]-}"; do
     src=${mapping%%:*}
     dst=${mapping#*:}
     eval "resolved_src=$src"
@@ -676,7 +726,7 @@ run_deploy_commands_in_container() {
   local container="$1"
   local cmd
 
-  for cmd in "${DEPLOY_COMMANDS[@]}"; do
+  for cmd in "${DEPLOY_COMMANDS[@]-}"; do
     [ -n "$cmd" ] || continue
     info "Running in container: $cmd"
     container_shell_exec "$container" "$cmd" || die "Deploy command failed: $cmd"
@@ -735,7 +785,7 @@ sync_env_to_remote() {
   tmpfile=$(mktemp) || die "Failed to create temporary file."
   {
     printf '# Generated by devbox deploy\n'
-    for var in "${DEPLOY_ENV_VARS[@]}"; do
+    for var in "${DEPLOY_ENV_VARS[@]-}"; do
       eval "value=\${$var-}"
       if [ -n "${value:-}" ]; then
         printf 'export %s=%q\n' "$var" "$value"
@@ -753,7 +803,7 @@ sync_files_to_remote() {
   local port="$2"
   local mapping src dst resolved_src
 
-  for mapping in "${DEPLOY_SYNC_FILES[@]}"; do
+  for mapping in "${DEPLOY_SYNC_FILES[@]-}"; do
     src=${mapping%%:*}
     dst=${mapping#*:}
     eval "resolved_src=$src"
@@ -770,7 +820,7 @@ run_deploy_commands_on_remote() {
   local port="$2"
   local cmd
 
-  for cmd in "${DEPLOY_COMMANDS[@]}"; do
+  for cmd in "${DEPLOY_COMMANDS[@]-}"; do
     [ -n "$cmd" ] || continue
     info "Running on remote host: $cmd"
     remote_exec "$target" "$port" "$cmd" || die "Remote deploy command failed on ${target}: $cmd"
@@ -833,7 +883,7 @@ deploy_remote_host() {
 
 create_container() {
   local raw_name="${1:-}"
-  local short_name full_name mount_dir image gpu_arg ssh_port deploy_after_create
+  local short_name full_name mount_dir image gpu_value ssh_port deploy_after_create
   local host_user host_group host_uid host_gid login_user
   local inherit_user_info create_user
   local run_args
@@ -888,7 +938,7 @@ create_container() {
   fi
 
   image=$(choose_image_interactively)
-  gpu_arg=$(collect_gpu_args || true)
+  gpu_value=$(collect_gpu_value || true)
   ssh_port=$(find_random_free_port)
   deploy_after_create=$(confirm "Deploy development environment after create?" "yes" && printf yes || printf no)
   login_user=$(resolve_login_user "$create_user" "$host_user")
@@ -908,23 +958,26 @@ create_container() {
     info "Container login user: root"
   fi
 
-  run_args="-d --name $full_name"
-  run_args="$run_args -w $CONTAINER_WORKDIR"
-  run_args="$run_args -v $mount_dir:$CONTAINER_WORKDIR"
-  run_args="$run_args -p ${ssh_port}:22"
-  run_args="$run_args -e DEVBOX_CREATE_USER=$create_user"
-  run_args="$run_args -e DEVBOX_USER=$host_user"
-  run_args="$run_args -e DEVBOX_GROUP=$host_group"
-  run_args="$run_args -e DEVBOX_UID=$host_uid"
-  run_args="$run_args -e DEVBOX_GID=$host_gid"
-  run_args="$run_args -e DEVBOX_WORKDIR=$CONTAINER_WORKDIR"
+  run_args=(
+    -d
+    --name "$full_name"
+    --hostname "$full_name"
+    -w "$CONTAINER_WORKDIR"
+    -v "$mount_dir:$CONTAINER_WORKDIR"
+    -p "${ssh_port}:22"
+    -e "DEVBOX_CREATE_USER=$create_user"
+    -e "DEVBOX_USER=$host_user"
+    -e "DEVBOX_GROUP=$host_group"
+    -e "DEVBOX_UID=$host_uid"
+    -e "DEVBOX_GID=$host_gid"
+    -e "DEVBOX_WORKDIR=$CONTAINER_WORKDIR"
+  )
 
-  if [ -n "$gpu_arg" ]; then
-    run_args="$run_args $gpu_arg"
+  if [ -n "$gpu_value" ]; then
+    run_args+=(--gpus "$gpu_value")
   fi
 
-  # shellcheck disable=SC2086
-  runtime run $run_args "$image" || die "Failed to create container: $full_name"
+  runtime run "${run_args[@]}" "$image" || die "Failed to create container: $full_name"
 
   info "Container created: $full_name"
   info "Connect via devbox SSH: bash ./devbox ssh ${short_name}"
