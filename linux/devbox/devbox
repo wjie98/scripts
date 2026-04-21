@@ -1,0 +1,1194 @@
+#!/usr/bin/env bash
+
+# =========================
+# Configuration Section
+# =========================
+
+# Replaceable container runtime command
+CONTAINER_CMD="${CONTAINER_CMD:-docker}"
+
+# Shared container name prefix
+CONTAINER_PREFIX="${CONTAINER_PREFIX:-devops-}"
+
+# Image prefix for interactive selection
+IMAGE_PREFIX="${IMAGE_PREFIX:-devops-}"
+
+# Workspace path inside container
+CONTAINER_WORKDIR="${CONTAINER_WORKDIR:-/workspace}"
+
+# Preferred shell inside container
+PREFERRED_SHELL="${PREFERRED_SHELL:-bash}"
+
+# Default answer when GPU support is detected
+DEFAULT_GPU_ENABLE="${DEFAULT_GPU_ENABLE:-yes}"
+
+# Host port range for random SSH port mapping
+PORT_RANGE_START="${PORT_RANGE_START:-20000}"
+PORT_RANGE_END="${PORT_RANGE_END:-39999}"
+
+# Environment variables to sync during deploy
+DEPLOY_ENV_VARS=(
+  PATH
+  LANG
+  LC_ALL
+  HTTP_PROXY
+  HTTPS_PROXY
+  NO_PROXY
+  http_proxy
+  https_proxy
+  no_proxy
+  GOPROXY
+  GIT_SSH_COMMAND
+)
+
+# Files or directories to sync during deploy
+# Format: "source_path:target_path"
+DEPLOY_SYNC_FILES=(
+  # "$HOME/.gitconfig:/root/.gitconfig"
+  # "$HOME/.ssh/config:/root/.ssh/config"
+)
+
+# Commands to run during deploy
+DEPLOY_COMMANDS=(
+  # "apt-get update"
+  # "apt-get install -y git vim curl"
+)
+
+# =========================
+# Utility Functions Section
+# =========================
+
+set -u
+
+info() {
+  printf '[INFO] %s\n' "$*"
+}
+
+warn() {
+  printf '[WARN] %s\n' "$*" >&2
+}
+
+error() {
+  printf '[ERROR] %s\n' "$*" >&2
+}
+
+die() {
+  error "$*"
+  exit 1
+}
+
+runtime() {
+  command "$CONTAINER_CMD" "$@"
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+ensure_runtime_available() {
+  command_exists "$CONTAINER_CMD" || die "Container runtime not found: $CONTAINER_CMD"
+}
+
+canonical_path() {
+  local target="$1"
+  if [ -d "$target" ]; then
+    (cd "$target" 2>/dev/null && pwd -P) || return 1
+  else
+    local dir base
+    dir=$(dirname "$target") || return 1
+    base=$(basename "$target") || return 1
+    (cd "$dir" 2>/dev/null && printf '%s/%s\n' "$(pwd -P)" "$base") || return 1
+  fi
+}
+
+is_home_dir() {
+  local path="$1"
+  local p h
+  p=$(canonical_path "$path") || return 1
+  h=$(canonical_path "$HOME") || return 1
+  [ "$p" = "$h" ]
+}
+
+prompt_input() {
+  local prompt="$1"
+  local default_value="${2:-}"
+  local answer
+
+  if [ -n "$default_value" ]; then
+    printf '%s [%s]: ' "$prompt" "$default_value" >&2
+  else
+    printf '%s: ' "$prompt" >&2
+  fi
+
+  IFS= read -r answer
+  if [ -z "$answer" ]; then
+    printf '%s\n' "$default_value"
+  else
+    printf '%s\n' "$answer"
+  fi
+}
+
+confirm() {
+  local prompt="$1"
+  local default_answer="${2:-yes}"
+  local answer suffix
+
+  case "$default_answer" in
+    yes|y|Y) suffix="[Y/n]" ;;
+    no|n|N) suffix="[y/N]" ;;
+    *) suffix="[y/n]" ;;
+  esac
+
+  while true; do
+    printf '%s %s: ' "$prompt" "$suffix" >&2
+    IFS= read -r answer
+    if [ -z "$answer" ]; then
+      answer="$default_answer"
+    fi
+    case "$answer" in
+      y|Y|yes|YES) return 0 ;;
+      n|N|no|NO) return 1 ;;
+      *) warn "Please answer yes or no." ;;
+    esac
+  done
+}
+
+choose_from_list() {
+  local title="$1"
+  shift
+  [ "$#" -gt 0 ] || return 1
+
+  local i
+  printf '%s\n' "$title" >&2
+  i=1
+  for item in "$@"; do
+    printf '  %d) %s\n' "$i" "$item" >&2
+    i=$((i + 1))
+  done
+
+  while true; do
+    printf 'Select an item by number: ' >&2
+    IFS= read -r i
+    case "$i" in
+      ''|*[!0-9]*) warn "Invalid number." ;;
+      *)
+        if [ "$i" -ge 1 ] && [ "$i" -le "$#" ]; then
+          eval "printf '%s\n' \"\${$i}\""
+          return 0
+        fi
+        warn "Number out of range."
+        ;;
+    esac
+  done
+}
+
+normalize_container_name() {
+  local name="$1"
+  case "$name" in
+    "$CONTAINER_PREFIX"*) printf '%s\n' "$name" ;;
+    *) printf '%s%s\n' "$CONTAINER_PREFIX" "$name" ;;
+  esac
+}
+
+strip_container_prefix() {
+  local name="$1"
+  case "$name" in
+    "$CONTAINER_PREFIX"*) printf '%s\n' "${name#"$CONTAINER_PREFIX"}" ;;
+    *) printf '%s\n' "$name" ;;
+  esac
+}
+
+container_exists() {
+  local name="$1"
+  runtime ps -a --format '{{.Names}}' 2>/dev/null | grep -Fx "$name" >/dev/null 2>&1
+}
+
+container_is_running() {
+  local name="$1"
+  runtime ps --format '{{.Names}}' 2>/dev/null | grep -Fx "$name" >/dev/null 2>&1
+}
+
+list_prefixed_containers() {
+  runtime ps -a --format '{{.Names}}' 2>/dev/null | grep "^${CONTAINER_PREFIX}" || true
+}
+
+get_container_status() {
+  local container="$1"
+  local status
+
+  status=$(runtime inspect --format '{{.State.Status}}' "$container" 2>/dev/null || true)
+  [ -n "$status" ] || status="unknown"
+  printf '%s\n' "$status"
+}
+
+get_container_image() {
+  local container="$1"
+  local image
+
+  image=$(runtime inspect --format '{{.Config.Image}}' "$container" 2>/dev/null || true)
+  printf '%s\n' "$image"
+}
+
+get_container_mount_source() {
+  local container="$1"
+  local mount_source
+
+  mount_source=$(runtime inspect --format '{{range .Mounts}}{{if eq .Destination "'"${CONTAINER_WORKDIR}"'"}}{{.Source}}{{end}}{{end}}' "$container" 2>/dev/null || true)
+  printf '%s\n' "$mount_source"
+}
+
+get_container_created_at() {
+  local container="$1"
+  local created_at
+
+  created_at=$(runtime inspect --format '{{.Created}}' "$container" 2>/dev/null || true)
+  printf '%s\n' "$created_at"
+}
+
+get_container_dev_uid_gid() {
+  local container="$1"
+
+  runtime exec "$container" sh -lc '
+if [ -f /etc/devbox/user.env ]; then
+  . /etc/devbox/user.env
+  printf "%s:%s\n" "${DEVBOX_UID:-}" "${DEVBOX_GID:-}"
+fi
+' 2>/dev/null || true
+}
+
+get_container_workdir() {
+  local container="$1"
+  local workdir
+
+  workdir=$(runtime inspect --format '{{.Config.WorkingDir}}' "$container" 2>/dev/null || true)
+  printf '%s\n' "$workdir"
+}
+
+get_container_port_bindings() {
+  local container="$1"
+  local bindings
+
+  bindings=$(runtime port "$container" 2>/dev/null || true)
+  printf '%s\n' "$bindings"
+}
+
+list_prefixed_images() {
+  runtime images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null \
+    | grep "^${IMAGE_PREFIX}" \
+    | grep -v '^<none>:' \
+    | grep -v ':<none>$' || true
+}
+
+resolve_container_name() {
+  local raw="${1:-}"
+  local containers selected
+
+  if [ -n "$raw" ]; then
+    normalize_container_name "$raw"
+    return 0
+  fi
+
+  containers=$(list_prefixed_containers)
+  [ -n "$containers" ] || die "No container found with prefix '${CONTAINER_PREFIX}'."
+
+  selected=$(choose_from_list "Available containers:" $(printf '%s\n' "$containers"))
+  [ -n "$selected" ] || die "No container selected."
+  printf '%s\n' "$selected"
+}
+
+choose_image_interactively() {
+  local images selected
+  images=$(list_prefixed_images)
+
+  [ -n "$images" ] || die "No local image found with prefix '${IMAGE_PREFIX}'. Build an image first."
+
+  selected=$(choose_from_list "Available images:" $(printf '%s\n' "$images"))
+  [ -n "$selected" ] || die "No image selected."
+  printf '%s\n' "$selected"
+}
+
+runtime_supports_gpus() {
+  runtime run --help 2>/dev/null | grep -q -- '--gpus'
+}
+
+collect_gpu_args() {
+  local gpu_spec
+
+  if ! runtime_supports_gpus; then
+    return 0
+  fi
+
+  if ! confirm "GPU support detected. Attach GPUs?" "$DEFAULT_GPU_ENABLE"; then
+    return 0
+  fi
+
+  gpu_spec=$(prompt_input "Enter GPU spec ('all', GPU ids like '0,1', or 'none')" "all")
+  case "$gpu_spec" in
+    none|NONE|"") return 0 ;;
+    all) printf '%s\n' "--gpus all" ;;
+    *) printf '%s\n' "--gpus device=${gpu_spec}" ;;
+  esac
+}
+
+host_user_name() {
+  id -un
+}
+
+host_group_name() {
+  id -gn
+}
+
+host_user_uid() {
+  id -u
+}
+
+host_user_gid() {
+  id -g
+}
+
+resolve_login_user() {
+  local create_user="$1"
+  local user_name="$2"
+
+  if [ "$create_user" = "yes" ] && [ "$user_name" != "root" ]; then
+    printf '%s\n' "$user_name"
+  else
+    printf '%s\n' 'root'
+  fi
+}
+
+is_port_in_use() {
+  local port="$1"
+
+  if command_exists ss; then
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1 && return 0
+  fi
+
+  if command_exists netstat; then
+    netstat -lnt 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1 && return 0
+  fi
+
+  if command_exists lsof; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && return 0
+  fi
+
+  return 1
+}
+
+find_random_free_port() {
+  local min="$PORT_RANGE_START"
+  local max="$PORT_RANGE_END"
+  local tries=100
+  local port
+
+  [ "$min" -lt "$max" ] || die "Invalid port range: ${min}-${max}"
+
+  while [ "$tries" -gt 0 ]; do
+    port=$((min + RANDOM % (max - min + 1)))
+    if ! is_port_in_use "$port"; then
+      printf '%s\n' "$port"
+      return 0
+    fi
+    tries=$((tries - 1))
+  done
+
+  die "Failed to find a free port in range ${min}-${max}."
+}
+
+find_default_pubkey() {
+  local key
+  for key in \
+    "$HOME/.ssh/id_ed25519.pub" \
+    "$HOME/.ssh/id_rsa.pub" \
+    "$HOME/.ssh/id_ecdsa.pub" \
+    "$HOME/.ssh/id_dsa.pub"
+  do
+    [ -f "$key" ] && { printf '%s\n' "$key"; return 0; }
+  done
+  return 1
+}
+
+find_default_private_key() {
+  local pubkey_file private_key
+
+  pubkey_file=$(find_default_pubkey) || return 1
+  private_key=${pubkey_file%.pub}
+  [ -f "$private_key" ] || return 1
+  printf '%s\n' "$private_key"
+}
+
+ensure_local_ssh_key() {
+  find_default_pubkey >/dev/null 2>&1 || die "No SSH public key found under ~/.ssh. Create one first."
+}
+
+container_shell_exec() {
+  local name="$1"
+  local script="$2"
+
+  if runtime exec "$name" sh -lc "command -v ${PREFERRED_SHELL} >/dev/null 2>&1"; then
+    runtime exec "$name" "${PREFERRED_SHELL}" -lc "$script"
+  else
+    runtime exec "$name" sh -lc "$script"
+  fi
+}
+
+copy_to_container() {
+  local src="$1"
+  local container="$2"
+  local dst="$3"
+
+  [ -e "$src" ] || die "Source path not found: $src"
+  container_shell_exec "$container" "mkdir -p $(printf '%q' "$(dirname "$dst")")"
+  runtime cp "$src" "${container}:${dst}"
+}
+
+remote_exec() {
+  local target="$1"
+  local port="$2"
+  local script="$3"
+  ssh ${REMOTE_SSH_OPTS:-} -p "$port" "$target" "sh -lc $(printf '%q' "$script")"
+}
+
+remote_copy() {
+  local src="$1"
+  local target="$2"
+  local port="$3"
+  local dst="$4"
+
+  [ -e "$src" ] || die "Source path not found: $src"
+  remote_exec "$target" "$port" "mkdir -p $(printf '%q' "$(dirname "$dst")")"
+
+  if [ -d "$src" ]; then
+    scp ${REMOTE_SCP_OPTS:-} -r -P "$port" "$src" "${target}:${dst}"
+  else
+    scp ${REMOTE_SCP_OPTS:-} -P "$port" "$src" "${target}:${dst}"
+  fi
+}
+
+remote_user_name() {
+  local target="$1"
+
+  case "$target" in
+    *@*) printf '%s\n' "${target%%@*}" ;;
+    *) printf '%s\n' "$(id -un)" ;;
+  esac
+}
+
+can_connect_remote_with_publickey() {
+  local target="$1"
+  local port="$2"
+
+  ssh ${REMOTE_SSH_OPTS:-} -o BatchMode=yes -o PreferredAuthentications=publickey -o ConnectTimeout=5 -p "$port" "$target" true \
+    >/dev/null 2>&1
+}
+
+can_connect_remote_with_password() {
+  local target="$1"
+  local port="$2"
+
+  ssh ${REMOTE_SSH_OPTS:-} -o PreferredAuthentications=password,keyboard-interactive -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -p "$port" "$target" true
+}
+
+start_remote_connection_mux() {
+  local target="$1"
+  local port="$2"
+  local control_path="$3"
+
+  ssh -o ControlMaster=yes -o ControlPersist=600 -o ControlPath="$control_path" -o PreferredAuthentications=password,keyboard-interactive,publickey -p "$port" -fN "$target"
+}
+
+stop_remote_connection_mux() {
+  local target="$1"
+  local port="$2"
+  local control_path="$3"
+
+  ssh -o ControlPath="$control_path" -p "$port" -O exit "$target" >/dev/null 2>&1 || true
+}
+
+get_container_dev_user() {
+  local container="$1"
+  local user_name
+
+  user_name=$(runtime exec "$container" sh -lc '
+if [ -f /etc/devbox/user.env ]; then
+  . /etc/devbox/user.env
+  if [ -n "${DEVBOX_USER:-}" ]; then
+    printf "%s\n" "${DEVBOX_USER}"
+  fi
+fi
+' 2>/dev/null || true)
+
+  [ -n "$user_name" ] || user_name="root"
+  printf '%s\n' "$user_name"
+}
+
+get_container_dev_home() {
+  local container="$1"
+  local user_name="$2"
+  local user_home
+
+  user_home=$(runtime exec "$container" sh -lc '
+if [ -f /etc/devbox/user.env ]; then
+  . /etc/devbox/user.env
+  if [ -n "${DEVBOX_HOME:-}" ] && [ "${DEVBOX_USER:-}" = "'"$(printf '%s' "$user_name")"'" ]; then
+    printf "%s\n" "${DEVBOX_HOME}"
+    exit 0
+  fi
+fi
+getent passwd "'"$(printf '%s' "$user_name")"'" | cut -d: -f6
+' 2>/dev/null || true)
+
+  printf '%s\n' "$user_home"
+}
+
+get_container_ssh_port() {
+  local container="$1"
+  local line
+
+  line=$(runtime port "$container" 22/tcp 2>/dev/null | head -n 1 || true)
+  [ -n "$line" ] || return 1
+
+  case "$line" in
+    *:*)
+      printf '%s\n' "${line##*:}"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+print_container_list_row() {
+  local container="$1"
+  local status ssh_port dev_user image mount_source
+
+  status=$(get_container_status "$container")
+  ssh_port=$(get_container_ssh_port "$container" || true)
+  dev_user=$(get_container_dev_user "$container")
+  image=$(get_container_image "$container")
+  mount_source=$(get_container_mount_source "$container")
+
+  [ -n "$ssh_port" ] || ssh_port="-"
+  [ -n "$dev_user" ] || dev_user="-"
+  [ -n "$image" ] || image="-"
+  [ -n "$mount_source" ] || mount_source="-"
+
+  printf '%-28s %-10s %-8s %-12s %-28s %s\n' \
+    "$container" "$status" "$ssh_port" "$dev_user" "$image" "$mount_source"
+}
+
+append_pubkey_to_container() {
+  local container="$1"
+  local pubkey_file dev_user dev_home tmpdir tmpfile escaped_home escaped_user
+
+  pubkey_file=$(find_default_pubkey) || die "No SSH public key found."
+  dev_user=$(get_container_dev_user "$container")
+  dev_home=$(get_container_dev_home "$container" "$dev_user")
+  [ -n "$dev_home" ] || die "Failed to resolve home directory for container user: $dev_user"
+  escaped_home=$(printf '%q' "$dev_home")
+  escaped_user=$(printf '%q' "$dev_user")
+
+  tmpdir=$(mktemp -d) || die "Failed to create temporary directory."
+  tmpfile="${tmpdir}/authorized_keys"
+  cp "$pubkey_file" "$tmpfile" || {
+    rm -rf "$tmpdir"
+    die "Failed to prepare temporary authorized_keys file."
+  }
+
+  container_shell_exec "$container" "mkdir -p /root/.ssh ${escaped_home}/.ssh /tmp && chmod 700 /root/.ssh ${escaped_home}/.ssh"
+  runtime cp "$tmpfile" "${container}:/tmp/devbox_authorized_key" || {
+    rm -rf "$tmpdir"
+    die "Failed to copy public key into container."
+  }
+
+  container_shell_exec "$container" "
+touch /root/.ssh/authorized_keys
+chmod 600 /root/.ssh/authorized_keys
+grep -qxF -f /tmp/devbox_authorized_key /root/.ssh/authorized_keys || cat /tmp/devbox_authorized_key >> /root/.ssh/authorized_keys
+
+touch ${escaped_home}/.ssh/authorized_keys
+chmod 600 ${escaped_home}/.ssh/authorized_keys
+grep -qxF -f /tmp/devbox_authorized_key ${escaped_home}/.ssh/authorized_keys || cat /tmp/devbox_authorized_key >> ${escaped_home}/.ssh/authorized_keys
+rm -f /tmp/devbox_authorized_key
+chown -R ${escaped_user}:${escaped_user} ${escaped_home}/.ssh || true
+"
+
+  rm -rf "$tmpdir"
+}
+
+restart_sshd_in_container() {
+  local container="$1"
+
+  container_shell_exec "$container" '
+set -e
+if command -v supervisorctl >/dev/null 2>&1; then
+  supervisorctl -c /etc/supervisor/conf.d/supervisord.conf restart sshd >/dev/null 2>&1 \
+    || supervisorctl -c /etc/supervisor/conf.d/supervisord.conf start sshd >/dev/null 2>&1 \
+    || true
+elif command -v service >/dev/null 2>&1; then
+  service ssh restart >/dev/null 2>&1 || service sshd restart >/dev/null 2>&1 || true
+elif command -v systemctl >/dev/null 2>&1; then
+  systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1 || true
+elif command -v pkill >/dev/null 2>&1 && command -v sshd >/dev/null 2>&1; then
+  pkill sshd >/dev/null 2>&1 || true
+  mkdir -p /var/run/sshd
+  sshd >/dev/null 2>&1 || true
+fi
+'
+}
+
+sync_env_to_container() {
+  local container="$1"
+  local tmpfile var value
+
+  tmpfile=$(mktemp) || die "Failed to create temporary file."
+  {
+    printf '# Generated by devbox deploy\n'
+    for var in "${DEPLOY_ENV_VARS[@]}"; do
+      eval "value=\${$var-}"
+      if [ -n "${value:-}" ]; then
+        printf 'export %s=%q\n' "$var" "$value"
+      fi
+    done
+  } > "$tmpfile"
+
+  copy_to_container "$tmpfile" "$container" "/etc/profile.d/devbox_env.sh"
+  rm -f "$tmpfile"
+}
+
+sync_files_to_container() {
+  local container="$1"
+  local mapping src dst resolved_src
+
+  for mapping in "${DEPLOY_SYNC_FILES[@]}"; do
+    src=${mapping%%:*}
+    dst=${mapping#*:}
+    eval "resolved_src=$src"
+    [ -n "$resolved_src" ] || continue
+    [ -n "$dst" ] || continue
+    [ -e "$resolved_src" ] || { warn "Skip missing path: $resolved_src"; continue; }
+    info "Copying to container: $resolved_src -> $dst"
+    copy_to_container "$resolved_src" "$container" "$dst"
+  done
+}
+
+run_deploy_commands_in_container() {
+  local container="$1"
+  local cmd
+
+  for cmd in "${DEPLOY_COMMANDS[@]}"; do
+    [ -n "$cmd" ] || continue
+    info "Running in container: $cmd"
+    container_shell_exec "$container" "$cmd" || die "Deploy command failed: $cmd"
+  done
+}
+
+deploy_local_container() {
+  local container="$1"
+
+  ensure_local_ssh_key
+
+  container_exists "$container" || die "Container does not exist: $container"
+
+  if ! container_is_running "$container"; then
+    info "Container is not running. Starting it first."
+    runtime start "$container" >/dev/null || die "Failed to start container: $container"
+  fi
+
+  append_pubkey_to_container "$container"
+  sync_env_to_container "$container"
+  sync_files_to_container "$container"
+  run_deploy_commands_in_container "$container"
+  restart_sshd_in_container "$container"
+
+  info "Local deploy completed for container: $container"
+}
+
+append_pubkey_to_remote() {
+  local target="$1"
+  local port="$2"
+  local remote_user pubkey_file pubkey_text
+
+  pubkey_file=$(find_default_pubkey) || die "No SSH public key found."
+  pubkey_text=$(cat "$pubkey_file") || die "Failed to read SSH public key."
+  remote_user=$(remote_user_name "$target")
+
+  info "Installing SSH public key on remote host: $target"
+
+  ssh ${REMOTE_SSH_OPTS:-} -p "$port" "$target" "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys" \
+    || die "Failed to prepare ~/.ssh on remote host: $target"
+
+  ssh ${REMOTE_SSH_OPTS:-} -p "$port" "$target" \
+    "grep -qxF $(printf '%q' "$pubkey_text") ~/.ssh/authorized_keys || printf '%s\n' $(printf '%q' "$pubkey_text") >> ~/.ssh/authorized_keys" \
+    || die "Failed to install SSH public key on remote host: $target"
+
+  if [ "$remote_user" = "root" ]; then
+    info "Remote target user is root. Public key was installed for root only."
+  fi
+}
+
+sync_env_to_remote() {
+  local target="$1"
+  local port="$2"
+  local tmpfile var value
+
+  tmpfile=$(mktemp) || die "Failed to create temporary file."
+  {
+    printf '# Generated by devbox deploy\n'
+    for var in "${DEPLOY_ENV_VARS[@]}"; do
+      eval "value=\${$var-}"
+      if [ -n "${value:-}" ]; then
+        printf 'export %s=%q\n' "$var" "$value"
+      fi
+    done
+  } > "$tmpfile"
+
+  scp ${REMOTE_SCP_OPTS:-} -P "$port" "$tmpfile" "${target}:~/.devbox_env.sh" >/dev/null || die "Failed to copy env file to remote host: $target"
+  remote_exec "$target" "$port" "grep -qxF 'source ~/.devbox_env.sh' ~/.bashrc || printf '\nsource ~/.devbox_env.sh\n' >> ~/.bashrc"
+  rm -f "$tmpfile"
+}
+
+sync_files_to_remote() {
+  local target="$1"
+  local port="$2"
+  local mapping src dst resolved_src
+
+  for mapping in "${DEPLOY_SYNC_FILES[@]}"; do
+    src=${mapping%%:*}
+    dst=${mapping#*:}
+    eval "resolved_src=$src"
+    [ -n "$resolved_src" ] || continue
+    [ -n "$dst" ] || continue
+    [ -e "$resolved_src" ] || { warn "Skip missing path: $resolved_src"; continue; }
+    info "Copying to remote: $resolved_src -> $dst"
+    remote_copy "$resolved_src" "$target" "$port" "$dst"
+  done
+}
+
+run_deploy_commands_on_remote() {
+  local target="$1"
+  local port="$2"
+  local cmd
+
+  for cmd in "${DEPLOY_COMMANDS[@]}"; do
+    [ -n "$cmd" ] || continue
+    info "Running on remote host: $cmd"
+    remote_exec "$target" "$port" "$cmd" || die "Remote deploy command failed on ${target}: $cmd"
+  done
+}
+
+deploy_remote_host() {
+  local target="$1"
+  local port="${2:-22}"
+  local pubkey_file
+  local control_dir control_path use_mux="no"
+
+  cleanup_remote_mux() {
+    if [ "$use_mux" = "yes" ]; then
+      stop_remote_connection_mux "$target" "$port" "$control_path"
+      rm -rf "$control_dir"
+      unset REMOTE_SSH_OPTS REMOTE_SCP_OPTS
+    fi
+  }
+
+  ensure_local_ssh_key
+  command_exists ssh || die "ssh command not found."
+  command_exists scp || die "scp command not found."
+  pubkey_file=$(find_default_pubkey) || die "No SSH public key found."
+  trap cleanup_remote_mux EXIT
+
+  if can_connect_remote_with_publickey "$target" "$port"; then
+    info "Remote public key authentication is already available: $target"
+  else
+    info "Remote public key authentication is not available yet: $target"
+    info "Trying password login so the public key can be installed."
+
+    control_dir=$(mktemp -d) || die "Failed to create temporary directory for SSH control socket."
+    control_path="${control_dir}/mux-%r@%h:%p"
+
+    if start_remote_connection_mux "$target" "$port" "$control_path"; then
+      use_mux="yes"
+      REMOTE_SSH_OPTS="-o ControlPath=${control_path}"
+      REMOTE_SCP_OPTS="-o ControlPath=${control_path}"
+      info "Password login succeeded. Installing SSH public key."
+      append_pubkey_to_remote "$target" "$port"
+    else
+      rm -rf "$control_dir"
+      die "Unable to log in to ${target} on port ${port}. Check network reachability and credentials, or run: ssh-copy-id -i ${pubkey_file} -p ${port} ${target}"
+    fi
+  fi
+
+  sync_env_to_remote "$target" "$port"
+  sync_files_to_remote "$target" "$port"
+  run_deploy_commands_on_remote "$target" "$port"
+
+  info "Remote deploy completed: $target"
+  trap - EXIT
+  cleanup_remote_mux
+}
+
+# =========================
+# Main Logic Section
+# =========================
+
+create_container() {
+  local raw_name="${1:-}"
+  local short_name full_name mount_dir image gpu_arg ssh_port deploy_after_create
+  local host_user host_group host_uid host_gid login_user
+  local inherit_user_info create_user
+  local run_args
+
+  ensure_runtime_available
+
+  if [ -n "$raw_name" ]; then
+    short_name=$(strip_container_prefix "$raw_name")
+  else
+    short_name=$(prompt_input "Enter container name (without prefix)")
+  fi
+
+  [ -n "$short_name" ] || die "Container name is required."
+
+  full_name=$(normalize_container_name "$short_name")
+
+  if container_exists "$full_name"; then
+    die "Container already exists: $full_name"
+  fi
+
+  if confirm "Inherit current host user information?" "yes"; then
+    inherit_user_info="yes"
+    create_user="yes"
+    host_user=$(host_user_name)
+    host_group=$(host_group_name)
+    host_uid=$(host_user_uid)
+    host_gid=$(host_user_gid)
+  else
+    inherit_user_info="no"
+    host_user=$(prompt_input "Container login user (use 'root' to skip normal user setup)" "dev")
+    [ -n "$host_user" ] || die "Container login user is required."
+
+    if [ "$host_user" = "root" ]; then
+      create_user="no"
+      host_group="root"
+      host_uid="0"
+      host_gid="0"
+    else
+      create_user="yes"
+      host_group=$(prompt_input "Container group name" "$host_user")
+      [ -n "$host_group" ] || host_group="$host_user"
+      host_uid=$(prompt_input "Container user UID (blank for default)" "1000")
+      host_gid=$(prompt_input "Container user GID (blank for default)" "$host_uid")
+    fi
+  fi
+
+  mount_dir=$(prompt_input "Project directory to mount" "$(pwd -P)")
+  [ -d "$mount_dir" ] || die "Directory does not exist: $mount_dir"
+
+  if is_home_dir "$mount_dir"; then
+    die "Mounting the home directory is not allowed: $mount_dir"
+  fi
+
+  image=$(choose_image_interactively)
+  gpu_arg=$(collect_gpu_args || true)
+  ssh_port=$(find_random_free_port)
+  deploy_after_create=$(confirm "Deploy development environment after create?" "yes" && printf yes || printf no)
+  login_user=$(resolve_login_user "$create_user" "$host_user")
+
+  info "Creating container: $full_name"
+  info "Image: $image"
+  info "Mount: $mount_dir -> $CONTAINER_WORKDIR"
+  info "SSH port mapping: ${ssh_port} -> 22"
+
+  if [ "$create_user" = "yes" ]; then
+    if [ "$inherit_user_info" = "yes" ]; then
+      info "Container dev user: ${host_user} (${host_uid}:${host_gid}) from host"
+    else
+      info "Container dev user: ${host_user} (${host_uid}:${host_gid})"
+    fi
+  else
+    info "Container login user: root"
+  fi
+
+  run_args="-d --name $full_name"
+  run_args="$run_args -w $CONTAINER_WORKDIR"
+  run_args="$run_args -v $mount_dir:$CONTAINER_WORKDIR"
+  run_args="$run_args -p ${ssh_port}:22"
+  run_args="$run_args -e DEVBOX_CREATE_USER=$create_user"
+  run_args="$run_args -e DEVBOX_USER=$host_user"
+  run_args="$run_args -e DEVBOX_GROUP=$host_group"
+  run_args="$run_args -e DEVBOX_UID=$host_uid"
+  run_args="$run_args -e DEVBOX_GID=$host_gid"
+  run_args="$run_args -e DEVBOX_WORKDIR=$CONTAINER_WORKDIR"
+
+  if [ -n "$gpu_arg" ]; then
+    run_args="$run_args $gpu_arg"
+  fi
+
+  # shellcheck disable=SC2086
+  runtime run $run_args "$image" || die "Failed to create container: $full_name"
+
+  info "Container created: $full_name"
+  info "Connect via devbox SSH: bash ./devbox ssh ${short_name}"
+  info "Direct SSH command: ssh ${login_user}@127.0.0.1 -p ${ssh_port}"
+
+  if [ "$deploy_after_create" = "yes" ]; then
+    deploy_local_container "$full_name"
+  fi
+}
+
+start_container() {
+  local container
+  container=$(resolve_container_name "${1:-}")
+  runtime start "$container" >/dev/null || die "Failed to start container: $container"
+  info "Container started: $container"
+}
+
+stop_container() {
+  local container
+  container=$(resolve_container_name "${1:-}")
+  runtime stop "$container" >/dev/null || die "Failed to stop container: $container"
+  info "Container stopped: $container"
+}
+
+restart_container() {
+  local container
+  container=$(resolve_container_name "${1:-}")
+  runtime restart "$container" >/dev/null || die "Failed to restart container: $container"
+  info "Container restarted: $container"
+}
+
+delete_container() {
+  local container
+  container=$(resolve_container_name "${1:-}")
+
+  container_exists "$container" || die "Container does not exist: $container"
+
+  if container_is_running "$container"; then
+    warn "Container is still running: $container"
+    if confirm "Stop the running container before deleting it?" "yes"; then
+      runtime stop "$container" >/dev/null || die "Failed to stop container: $container"
+      info "Container stopped: $container"
+    else
+      die "Refusing to delete a running container."
+    fi
+  fi
+
+  if ! confirm "Delete container '${container}'?" "no"; then
+    die "Delete operation cancelled."
+  fi
+
+  runtime rm "$container" >/dev/null || die "Failed to delete container: $container"
+  info "Container deleted: $container"
+}
+
+enter_container() {
+  local container
+  container=$(resolve_container_name "${1:-}")
+
+  if ! container_is_running "$container"; then
+    die "Container is not running: $container"
+  fi
+
+  info "Opening maintenance shell: $container"
+  info "Login user: root"
+
+  if runtime exec "$container" sh -lc 'command -v bash >/dev/null 2>&1'; then
+    runtime exec -it "$container" bash
+  else
+    runtime exec -it "$container" sh
+  fi
+}
+
+ssh_container() {
+  local container dev_user ssh_port private_key
+
+  ensure_local_ssh_key
+  command_exists ssh || die "ssh command not found."
+  container=$(resolve_container_name "${1:-}")
+
+  if ! container_is_running "$container"; then
+    die "Container is not running: $container"
+  fi
+
+  append_pubkey_to_container "$container"
+  restart_sshd_in_container "$container"
+
+  dev_user=$(get_container_dev_user "$container")
+  ssh_port=$(get_container_ssh_port "$container" || true)
+  private_key=$(find_default_private_key) || die "No matching SSH private key found for the default public key."
+  [ -n "$ssh_port" ] || die "Container SSH port is not mapped: $container"
+
+  info "Connecting via SSH: ${dev_user}@127.0.0.1:${ssh_port}"
+  exec ssh -i "$private_key" -o IdentitiesOnly=yes -o PreferredAuthentications=publickey -p "$ssh_port" "${dev_user}@127.0.0.1"
+}
+
+list_containers() {
+  local containers container
+
+  ensure_runtime_available
+  containers=$(list_prefixed_containers)
+
+  if [ -z "$containers" ]; then
+    info "No container found with prefix '${CONTAINER_PREFIX}'."
+    return 0
+  fi
+
+  printf '%-28s %-10s %-8s %-12s %-28s %s\n' \
+    'NAME' 'STATUS' 'SSH' 'DEV_USER' 'IMAGE' 'MOUNT'
+
+  while IFS= read -r container; do
+    [ -n "$container" ] || continue
+    print_container_list_row "$container"
+  done <<EOF
+$containers
+EOF
+}
+
+inspect_container() {
+  local container status ssh_port dev_user dev_uid_gid image mount_source created_at workdir port_bindings
+
+  container=$(resolve_container_name "${1:-}")
+  container_exists "$container" || die "Container does not exist: $container"
+
+  status=$(get_container_status "$container")
+  ssh_port=$(get_container_ssh_port "$container" || true)
+  dev_user=$(get_container_dev_user "$container")
+  dev_uid_gid=$(get_container_dev_uid_gid "$container")
+  image=$(get_container_image "$container")
+  mount_source=$(get_container_mount_source "$container")
+  created_at=$(get_container_created_at "$container")
+  workdir=$(get_container_workdir "$container")
+  port_bindings=$(get_container_port_bindings "$container")
+
+  [ -n "$ssh_port" ] || ssh_port="-"
+  [ -n "$dev_user" ] || dev_user="-"
+  [ -n "$dev_uid_gid" ] || dev_uid_gid="-"
+  [ -n "$image" ] || image="-"
+  [ -n "$mount_source" ] || mount_source="-"
+  [ -n "$created_at" ] || created_at="-"
+  [ -n "$workdir" ] || workdir="-"
+  [ -n "$port_bindings" ] || port_bindings="-"
+
+  printf 'Name: %s\n' "$container"
+  printf 'Short Name: %s\n' "$(strip_container_prefix "$container")"
+  printf 'Status: %s\n' "$status"
+  printf 'Image: %s\n' "$image"
+  printf 'Dev User: %s\n' "$dev_user"
+  printf 'Dev UID:GID: %s\n' "$dev_uid_gid"
+  printf 'SSH Port: %s\n' "$ssh_port"
+  printf 'Workdir: %s\n' "$workdir"
+  printf 'Mount: %s -> %s\n' "$mount_source" "$CONTAINER_WORKDIR"
+  printf 'Created At: %s\n' "$created_at"
+  printf 'Port Bindings:\n%s\n' "$port_bindings"
+}
+
+usage() {
+  cat <<EOF
+Usage:
+  $0 list
+  $0 run [name]
+  $0 start [name]
+  $0 stop [name]
+  $0 restart [name]
+  $0 rm [name]
+  $0 info [name]
+  $0 shell [name]
+  $0 ssh [name]
+  $0 deploy [name]
+  $0 deploy-remote [user@]host [-p port]
+
+Notes:
+  - Container names can be passed without prefix. Prefix will be added automatically.
+  - If no container name is passed to start/stop/restart/rm/info/shell/ssh/deploy, an interactive list will be shown.
+  - Run requires an existing local image whose name starts with: ${IMAGE_PREFIX}
+  - SSH port will be mapped automatically to a random free host port.
+  - Shell opens a maintenance shell as root inside the container.
+  - Ssh connects through the published container SSH port as the configured login user.
+  - Deploy-remote works through SSH to the target user, tries password login only to install that user's public key, and does not touch root unless the target user is root.
+  - Runtime default: ${CONTAINER_CMD}
+  - Prefix default: ${CONTAINER_PREFIX}
+
+Environment overrides:
+  CONTAINER_CMD
+  CONTAINER_PREFIX
+  IMAGE_PREFIX
+  CONTAINER_WORKDIR
+  PORT_RANGE_START
+  PORT_RANGE_END
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+
+  [ -n "$cmd" ] || {
+    usage
+    exit 1
+  }
+
+  shift || true
+
+  case "$cmd" in
+    list)
+      list_containers
+      ;;
+    run)
+      create_container "${1:-}"
+      ;;
+    start)
+      start_container "${1:-}"
+      ;;
+    stop)
+      stop_container "${1:-}"
+      ;;
+    restart)
+      restart_container "${1:-}"
+      ;;
+    rm)
+      delete_container "${1:-}"
+      ;;
+    info)
+      inspect_container "${1:-}"
+      ;;
+    shell)
+      enter_container "${1:-}"
+      ;;
+    ssh)
+      ssh_container "${1:-}"
+      ;;
+    deploy)
+      local container
+      container=$(resolve_container_name "${1:-}")
+      deploy_local_container "$container"
+      ;;
+    deploy-remote)
+      [ -n "${1:-}" ] || die "Missing remote target. Usage: $0 deploy-remote [user@]host [-p port]"
+      local target="$1"
+      local port="22"
+      shift || true
+
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          -p)
+            shift
+            [ -n "${1:-}" ] || die "Missing port after -p"
+            port="$1"
+            ;;
+          *)
+            die "Unknown deploy-remote argument: $1"
+            ;;
+        esac
+        shift || true
+      done
+
+      deploy_remote_host "$target" "$port"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "Unknown command: $cmd"
+      ;;
+  esac
+}
+
+main "$@"
