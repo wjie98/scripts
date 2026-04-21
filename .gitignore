@@ -1,0 +1,53 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor directories and files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment and local overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build and temp outputs
+dist/
+build/
+coverage/
+tmp/
+.tmp/
+
+# Local tool metadata
+.codex

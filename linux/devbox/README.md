@@ -1,56 +1,56 @@
 # Devbox
 
-`devbox` is a small Bash-based toolkit for building and managing SSH-enabled development containers.
+`devbox` is a Bash toolkit for creating and operating SSH-enabled development containers on a local Linux machine. It is designed for a simple workflow: build an image, create a container with a mounted project directory, then enter it through SSH as a normal development user.
 
-It includes:
+The directory contains:
 
-- `devbox`: container lifecycle, login, deploy, and remote deploy commands
-- `build-image.sh`: image build helper for the bundled Ubuntu devbox image
-- `Dockerfile`: base image definition
-- `devbox-init.sh`: container init script that prepares the runtime user
+- `devbox`: the main command-line entry point
+- `build-image.sh`: image build helper
+- `Dockerfile`: Ubuntu-based development image
+- `devbox-init.sh`: container init logic that creates the runtime user and starts services
 - `supervisord.conf`: process supervision for `sshd`
 
-## Files
+## Requirements
 
-- `devbox`: main entry point
-- `build-image.sh`: build the image `devops-ubuntu:24.04`
-- `Dockerfile`: image definition
-- `devbox-init.sh`: runtime init script
-- `supervisord.conf`: supervisor config
+- A container runtime compatible with the Docker CLI, such as Docker or Podman
+- Local `ssh` for `devbox ssh` and `deploy-remote`
+- A local SSH key pair in `~/.ssh`, typically `id_ed25519` or `id_rsa`
+
+The default runtime is `docker`. Override it with `CONTAINER_CMD` when needed.
 
 ## Quick Start
 
-Build the image first:
+Build the bundled image:
 
 ```bash
 bash ./build-image.sh
 ```
 
-Create and run a container:
+Create a container from an image whose name starts with `devops-`:
 
 ```bash
 bash ./devbox run
 ```
 
-List containers:
+List managed containers:
 
 ```bash
 bash ./devbox list
 ```
 
-Log in through SSH:
+Open a normal development session through SSH:
 
 ```bash
 bash ./devbox ssh
 ```
 
-Open a maintenance shell as `root`:
+Open a direct maintenance shell as `root`:
 
 ```bash
 bash ./devbox shell
 ```
 
-## Main Commands
+## Command Reference
 
 Show all managed containers:
 
@@ -58,7 +58,7 @@ Show all managed containers:
 bash ./devbox list
 ```
 
-Create a container:
+Create a new container:
 
 ```bash
 bash ./devbox run [name]
@@ -78,50 +78,130 @@ Remove a container:
 bash ./devbox rm [name]
 ```
 
-Show container details:
+Inspect one container:
 
 ```bash
 bash ./devbox info [name]
 ```
 
-Open a root maintenance shell:
+Open a root shell inside the container:
 
 ```bash
 bash ./devbox shell [name]
 ```
 
-Connect to a container by SSH:
+SSH into the container as the configured development user:
 
 ```bash
 bash ./devbox ssh [name]
 ```
 
-Deploy local container environment:
+Deploy local development settings into a local container:
 
 ```bash
 bash ./devbox deploy [name]
 ```
 
-Deploy to a remote host:
+Deploy the same environment model to a remote Linux host:
 
 ```bash
 bash ./devbox deploy-remote [user@]host [-p port]
 ```
 
-## Container Login Modes
+Show built-in help:
 
-There are two ways to access a local container:
+```bash
+bash ./devbox --help
+```
 
-- `ssh`: normal development login through the container SSH service as the configured login user
-- `shell`: maintenance shell opened directly as `root`
+If a command accepts `[name]` and the name is omitted, `devbox` shows an interactive selection list.
 
-Use `ssh` for normal daily development.
+## Typical Workflow
 
-Use `shell` for inspection, repair, or administrative work.
+1. Build the image with `bash ./build-image.sh`.
+2. Run `bash ./devbox run mybox` and answer the prompts.
+3. Let `devbox` map a random SSH port on `127.0.0.1`.
+4. Optionally run an initial deploy during creation.
+5. Use `bash ./devbox ssh mybox` for daily work.
+6. Use `bash ./devbox shell mybox` only for repair or administration.
+
+## What `run` Prompts For
+
+When you create a container, `devbox` collects:
+
+- Container name
+- Whether to inherit the current host user name, group, UID, and GID
+- A custom login user, group, UID, and GID if you do not inherit host values
+- The project directory to mount into the container
+- The image to use, selected from local images whose name starts with `IMAGE_PREFIX`
+- Whether GPU access should be attached when the runtime advertises `--gpus`
+- Whether to run `deploy` immediately after container creation
+
+The mounted project directory becomes the container working directory, which defaults to `/workspace`.
+
+`devbox` refuses to mount your home directory directly. That guard exists to prevent broad and accidental host exposure.
+
+## Access Modes
+
+There are two main ways to enter a local container:
+
+- `ssh`: the normal development path, using the configured development user and the published SSH port
+- `shell`: a direct `docker exec` or `podman exec` shell as `root`
+
+Use `ssh` for day-to-day development because it matches the intended login user, shell environment, and file ownership model.
+
+Use `shell` for system inspection, package repair, or other administrative work.
+
+## Local Deploy
+
+`bash ./devbox deploy [name]` prepares a local container for interactive development.
+
+It does the following:
+
+- Verifies that a local SSH public key exists
+- Appends that public key to both the container user's and `root`'s `authorized_keys`
+- Writes exported environment variables to `/etc/profile.d/devbox_env.sh`
+- Copies configured files and directories into the container
+- Runs configured deploy commands inside the container
+- Restarts `sshd`
+
+The deploy behavior is configured near the top of the `devbox` script:
+
+- `DEPLOY_ENV_VARS`
+- `DEPLOY_SYNC_FILES`
+- `DEPLOY_COMMANDS`
+
+Example pattern:
+
+```bash
+# Edit the arrays in ./devbox first, then apply them
+bash ./devbox deploy mybox
+```
+
+## Remote Deploy
+
+`deploy-remote` applies the same environment-sync idea to a remote Linux host over SSH. It is separate from local container creation.
+
+Behavior summary:
+
+- It first tries public-key authentication.
+- If that fails, it tries an SSH connection that can prompt for a password.
+- When password login succeeds, it installs your local public key for the target user.
+- It does not modify `root` unless the target account itself is `root`.
+- It reuses a temporary SSH control connection so you usually enter the password only once.
+
+Examples:
+
+```bash
+bash ./devbox deploy-remote dev@example.com
+bash ./devbox deploy-remote root@example.com -p 2222
+```
+
+If both key-based and password-based login fail, the script exits and suggests an `ssh-copy-id` command.
 
 ## Image Build
 
-The bundled build helper creates this image by default:
+The bundled image helper builds this image by default:
 
 ```text
 devops-ubuntu:24.04
@@ -133,87 +213,94 @@ Build it with:
 bash ./build-image.sh
 ```
 
-If the image already exists, the script asks whether it should be replaced.
+You can override the build inputs:
 
-If the image is still used by containers, the script prints the container list and exits.
-
-## Run Workflow
-
-When you create a container with `run`, the script will guide you through:
-
-- container name
-- whether to inherit the current host user
-- custom login user, group, uid, and gid when not inheriting
-- project directory mount
-- image selection
-- GPU mapping when supported
-- automatic deploy after creation
-
-The container publishes its SSH port to a random free host port.
-
-After creation, `devbox` prints both:
-
-- the recommended `bash ./devbox ssh <name>` command
-- the direct raw `ssh user@127.0.0.1 -p <port>` command
-
-## Local Deploy
-
-`deploy` prepares a local container for development use.
-
-It will:
-
-- ensure your local SSH public key exists
-- install the public key into the container
-- sync configured environment variables
-- sync configured files
-- run configured deploy commands
-- restart `sshd` inside the container when needed
-
-Configuration lives at the top of `devbox`:
-
-- `DEPLOY_ENV_VARS`
-- `DEPLOY_SYNC_FILES`
-- `DEPLOY_COMMANDS`
-
-## Remote Deploy
-
-`deploy-remote` is for a remote Linux host, not for local containers.
-
-It only depends on local `ssh` and `scp`.
-
-Its behavior is:
-
-- try public key login first
-- if public key login is unavailable, try password login
-- if password login succeeds, install your public key for the target user
-- do not touch `root` unless the target user is `root`
-- reuse a temporary SSH master connection so you usually enter the password only once
-
-If both public key login and password login fail, `devbox` exits and prints a suggested `ssh-copy-id` command.
-
-## Environment Variables
-
-Common overrides:
-
-```text
-CONTAINER_CMD
-CONTAINER_PREFIX
-IMAGE_PREFIX
-CONTAINER_WORKDIR
-PORT_RANGE_START
-PORT_RANGE_END
+```bash
+IMAGE_NAME=my-devbox:latest CONTAINER_CMD=podman bash ./build-image.sh
 ```
 
-Example:
+The script checks whether the image already exists.
+
+- If the image does not exist, it builds it.
+- If the image exists, it asks before overwriting it.
+- If any containers still use that image, it refuses to remove the image and prints the blocking container list.
+
+## Runtime Defaults
+
+Important defaults from `devbox`:
+
+- `CONTAINER_CMD=docker`
+- `CONTAINER_PREFIX=devops-`
+- `IMAGE_PREFIX=devops-`
+- `CONTAINER_WORKDIR=/workspace`
+- `PREFERRED_SHELL=bash`
+- `DEFAULT_GPU_ENABLE=yes`
+- `PORT_RANGE_START=20000`
+- `PORT_RANGE_END=39999`
+
+Useful overrides:
 
 ```bash
 CONTAINER_CMD=podman bash ./devbox list
+CONTAINER_PREFIX=work- IMAGE_PREFIX=work- bash ./devbox run
+CONTAINER_WORKDIR=/src bash ./devbox info mybox
+PORT_RANGE_START=30000 PORT_RANGE_END=30999 bash ./devbox run mybox
 ```
+
+## Image Contents
+
+The bundled `Dockerfile` creates an Ubuntu 24.04 image with common development tools and an SSH server. It includes packages such as:
+
+- `bash`, `git`, `vim`, `tmux`, `htop`
+- `curl`, `iproute2`, `net-tools`, `iputils-ping`
+- `python3`, `python3-pip`, `gcc`
+- `openssh-server`, `supervisor`, `tini`, `sudo`
+
+Container startup is handled by `devbox-init.sh`.
+
+That script:
+
+- Creates or reuses the requested user and group
+- Aligns UID and GID when possible
+- Creates `~/.ssh/authorized_keys`
+- Grants passwordless `sudo` to the non-root development user
+- Stores resolved runtime values in `/etc/devbox/user.env`
+- Starts `supervisord`, which in turn keeps `sshd` running
+
+## GPU Support
+
+When the selected container runtime reports support for `--gpus`, `devbox run` offers to attach GPUs.
+
+Typical answers are:
+
+- `all`
+- `0,1`
+- `none`
+
+This is only a thin pass-through to the runtime. Driver installation, NVIDIA Container Toolkit setup, and host compatibility are still your responsibility.
+
+## Troubleshooting
+
+`No local image found with prefix ...`
+
+Build an image first, or adjust `IMAGE_PREFIX`.
+
+`No SSH public key found under ~/.ssh`
+
+Create a local SSH key pair before using `ssh`, `deploy`, or `deploy-remote`.
+
+`Container SSH port is not mapped`
+
+The container may not have been created by `devbox`, or the port mapping may have been altered manually.
+
+`Container runtime not found`
+
+Install Docker or Podman, or set `CONTAINER_CMD` correctly.
 
 ## Notes
 
-- Container names are normalized with the configured prefix.
-- If a command accepts `[name]` and you omit it, `devbox` shows an interactive selection list.
-- The bundled image uses `tini + supervisord + sshd`.
-- `shell` always enters as `root`.
-- `ssh` always targets the configured container login user.
+- Container names are normalized with `CONTAINER_PREFIX`.
+- Short names like `mybox` become `devops-mybox` by default.
+- `ssh` always targets the configured development user, not `root`.
+- `shell` always opens as `root`.
+- The helper is intentionally interactive. It is optimized for operator-driven local usage rather than unattended automation.
