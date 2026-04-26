@@ -10,6 +10,8 @@ SCRIPT_VERSION="4.0"
 # Shared autossh and ssh options applied to every tunnel unless overridden.
 # Keep each option as one array item so spaces in later arguments are safe.
 GLOBAL_AUTOSSH_OPTIONS=(
+    "-M"
+    "0"
     "-f"
 )
 
@@ -72,18 +74,25 @@ description=GPU02 SSH tunnel
 # Utility Functions
 # ==============================================================================
 
+if [[ -z "${BASH_VERSION:-}" ]]; then
+    echo "Error: ${SCRIPT_NAME} must be run with bash, not ${SHELL:-the current shell}." >&2
+    echo "Run it directly as ${0} or with: bash ${0}" >&2
+    exit 1
+fi
+
 declare -a TUNNEL_IDS=()
-declare -A TUNNEL_GROUP=()
-declare -A TUNNEL_NAME=()
-declare -A TUNNEL_MODE=()
-declare -A TUNNEL_LOCAL=()
-declare -A TUNNEL_REMOTE=()
-declare -A TUNNEL_SERVER=()
-declare -A TUNNEL_SSH_PORT=()
-declare -A TUNNEL_JUMP=()
-declare -A TUNNEL_KEY=()
-declare -A TUNNEL_SSH_OPTIONS=()
-declare -A TUNNEL_DESCRIPTION=()
+declare -a TUNNEL_GROUP=()
+declare -a TUNNEL_NAME=()
+declare -a TUNNEL_MODE=()
+declare -a TUNNEL_LOCAL=()
+declare -a TUNNEL_REMOTE=()
+declare -a TUNNEL_SERVER=()
+declare -a TUNNEL_SSH_PORT=()
+declare -a TUNNEL_JUMP=()
+declare -a TUNNEL_KEY=()
+declare -a TUNNEL_SSH_OPTIONS=()
+declare -a TUNNEL_DESCRIPTION=()
+declare -a BUILT_AUTOSSH_COMMAND=()
 
 trim() {
     local value="${1}"
@@ -149,8 +158,9 @@ regex_escape() {
 parse_definition() {
     local definition="${1}"
     local index="${2}"
-    local line key value id server host port normalized_mode
-    local -A cfg=()
+    local line key value id host port normalized_mode
+    local cfg_group="" cfg_name="" cfg_mode="" cfg_local="" cfg_remote="" cfg_server=""
+    local cfg_ssh_port="" cfg_jump="" cfg_key="" cfg_ssh_options="" cfg_description=""
 
     while IFS= read -r line; do
         line="$(trim "${line}")"
@@ -159,67 +169,79 @@ parse_definition() {
 
         key="$(trim "${line%%=*}")"
         value="$(trim "${line#*=}")"
-        cfg["${key}"]="${value}"
+        case "${key}" in
+            group) cfg_group="${value}" ;;
+            name) cfg_name="${value}" ;;
+            mode) cfg_mode="${value}" ;;
+            local) cfg_local="${value}" ;;
+            remote) cfg_remote="${value}" ;;
+            server) cfg_server="${value}" ;;
+            ssh_port) cfg_ssh_port="${value}" ;;
+            jump) cfg_jump="${value}" ;;
+            key) cfg_key="${value}" ;;
+            ssh_options) cfg_ssh_options="${value}" ;;
+            description) cfg_description="${value}" ;;
+        esac
     done <<< "${definition}"
 
-    cfg[mode]="${cfg[mode]:-local}"
-    normalized_mode="$(normalize_mode "${cfg[mode]}")" || {
-        echo "Error: invalid mode '${cfg[mode]}' in tunnel definition #${index}." >&2
+    cfg_mode="${cfg_mode:-local}"
+    normalized_mode="$(normalize_mode "${cfg_mode}")" || {
+        echo "Error: invalid mode '${cfg_mode}' in tunnel definition #${index}." >&2
         return 1
     }
-    cfg[mode]="${normalized_mode}"
+    cfg_mode="${normalized_mode}"
 
-    if [[ -z "${cfg[group]}" || -z "${cfg[name]}" ]]; then
+    if [[ -z "${cfg_group}" || -z "${cfg_name}" ]]; then
         echo "Error: tunnel definition #${index} must set group and name." >&2
         return 1
     fi
 
-    if [[ -z "${cfg[server]}" ]]; then
-        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set server." >&2
+    if [[ -z "${cfg_server}" ]]; then
+        echo "Error: tunnel '${cfg_group}:${cfg_name}' must set server." >&2
         return 1
     fi
 
-    if [[ -z "${cfg[local]}" ]]; then
-        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set local." >&2
+    if [[ -z "${cfg_local}" ]]; then
+        echo "Error: tunnel '${cfg_group}:${cfg_name}' must set local." >&2
         return 1
     fi
 
-    if [[ "${cfg[mode]}" != "socks-proxy" && -z "${cfg[remote]}" ]]; then
-        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set remote for ${cfg[mode]} mode." >&2
+    if [[ "${cfg_mode}" != "socks-proxy" && -z "${cfg_remote}" ]]; then
+        echo "Error: tunnel '${cfg_group}:${cfg_name}' must set remote for ${cfg_mode} mode." >&2
         return 1
     fi
 
-    IFS=':' read -r host port <<< "${cfg[server]}"
+    IFS=':' read -r host port <<< "${cfg_server}"
     if [[ -z "${host}" ]]; then
-        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' has an invalid server value." >&2
+        echo "Error: tunnel '${cfg_group}:${cfg_name}' has an invalid server value." >&2
         return 1
     fi
-    cfg[server]="${host}"
-    cfg[ssh_port]="${cfg[ssh_port]:-${port}}"
+    cfg_server="${host}"
+    cfg_ssh_port="${cfg_ssh_port:-${port}}"
 
-    cfg[key]="${cfg[key]:-${GLOBAL_SSH_KEY}}"
-    cfg[jump]="${cfg[jump]:-${GLOBAL_SSH_JUMP}}"
-    [[ -n "${cfg[key]}" ]] && cfg[key]="$(expand_path "${cfg[key]}")"
+    cfg_key="${cfg_key:-${GLOBAL_SSH_KEY}}"
+    cfg_jump="${cfg_jump:-${GLOBAL_SSH_JUMP}}"
+    [[ -n "${cfg_key}" ]] && cfg_key="$(expand_path "${cfg_key}")"
 
-    id="${cfg[group]}:${cfg[name]}"
+    id="${#TUNNEL_IDS[@]}"
     TUNNEL_IDS+=("${id}")
-    TUNNEL_GROUP["${id}"]="${cfg[group]}"
-    TUNNEL_NAME["${id}"]="${cfg[name]}"
-    TUNNEL_MODE["${id}"]="${cfg[mode]}"
-    TUNNEL_LOCAL["${id}"]="${cfg[local]}"
-    TUNNEL_REMOTE["${id}"]="${cfg[remote]}"
-    TUNNEL_SERVER["${id}"]="${cfg[server]}"
-    TUNNEL_SSH_PORT["${id}"]="${cfg[ssh_port]}"
-    TUNNEL_JUMP["${id}"]="${cfg[jump]}"
-    TUNNEL_KEY["${id}"]="${cfg[key]}"
-    TUNNEL_SSH_OPTIONS["${id}"]="${cfg[ssh_options]}"
-    TUNNEL_DESCRIPTION["${id}"]="${cfg[description]}"
+    TUNNEL_GROUP["${id}"]="${cfg_group}"
+    TUNNEL_NAME["${id}"]="${cfg_name}"
+    TUNNEL_MODE["${id}"]="${cfg_mode}"
+    TUNNEL_LOCAL["${id}"]="${cfg_local}"
+    TUNNEL_REMOTE["${id}"]="${cfg_remote}"
+    TUNNEL_SERVER["${id}"]="${cfg_server}"
+    TUNNEL_SSH_PORT["${id}"]="${cfg_ssh_port}"
+    TUNNEL_JUMP["${id}"]="${cfg_jump}"
+    TUNNEL_KEY["${id}"]="${cfg_key}"
+    TUNNEL_SSH_OPTIONS["${id}"]="${cfg_ssh_options}"
+    TUNNEL_DESCRIPTION["${id}"]="${cfg_description}"
 }
 
 load_tunnel_definitions() {
     local index
 
-    for index in "${!TUNNEL_DEFINITIONS[@]}"; do
+    for ((index = 0; index < ${#TUNNEL_DEFINITIONS[@]}; index++)); do
         parse_definition "${TUNNEL_DEFINITIONS[${index}]}" "$((index + 1))" || return 1
     done
 }
@@ -264,39 +286,38 @@ tunnel_matches_group() {
 
 build_autossh_command() {
     local id="${1}"
-    local -n out_cmd="${2}"
     local option mode
 
-    out_cmd=("autossh")
-    out_cmd+=("${GLOBAL_AUTOSSH_OPTIONS[@]}")
-    out_cmd+=("${GLOBAL_SSH_OPTIONS[@]}")
+    BUILT_AUTOSSH_COMMAND=("autossh")
+    BUILT_AUTOSSH_COMMAND+=("${GLOBAL_AUTOSSH_OPTIONS[@]}")
+    BUILT_AUTOSSH_COMMAND+=("${GLOBAL_SSH_OPTIONS[@]}")
 
     if [[ -n "${TUNNEL_SSH_OPTIONS[${id}]}" ]]; then
         # shellcheck disable=SC2206
         local extra_options=(${TUNNEL_SSH_OPTIONS[${id}]})
-        out_cmd+=("${extra_options[@]}")
+        BUILT_AUTOSSH_COMMAND+=("${extra_options[@]}")
     fi
 
     mode="${TUNNEL_MODE[${id}]}"
     case "${mode}" in
         local-forward)
-            out_cmd+=("-L" "${TUNNEL_LOCAL[${id}]}:${TUNNEL_REMOTE[${id}]}")
+            BUILT_AUTOSSH_COMMAND+=("-L" "${TUNNEL_LOCAL[${id}]}:${TUNNEL_REMOTE[${id}]}")
             ;;
         remote-forward)
-            out_cmd+=("-R" "${TUNNEL_REMOTE[${id}]}:${TUNNEL_LOCAL[${id}]}")
+            BUILT_AUTOSSH_COMMAND+=("-R" "${TUNNEL_REMOTE[${id}]}:${TUNNEL_LOCAL[${id}]}")
             ;;
         socks-proxy)
-            out_cmd+=("-D" "${TUNNEL_LOCAL[${id}]}")
+            BUILT_AUTOSSH_COMMAND+=("-D" "${TUNNEL_LOCAL[${id}]}")
             ;;
     esac
 
-    [[ -n "${TUNNEL_KEY[${id}]}" ]] && out_cmd+=("-i" "${TUNNEL_KEY[${id}]}")
-    [[ -n "${TUNNEL_SSH_PORT[${id}]}" ]] && out_cmd+=("-p" "${TUNNEL_SSH_PORT[${id}]}")
-    [[ -n "${TUNNEL_JUMP[${id}]}" ]] && out_cmd+=("-J" "${TUNNEL_JUMP[${id}]}")
+    [[ -n "${TUNNEL_KEY[${id}]}" ]] && BUILT_AUTOSSH_COMMAND+=("-i" "${TUNNEL_KEY[${id}]}")
+    [[ -n "${TUNNEL_SSH_PORT[${id}]}" ]] && BUILT_AUTOSSH_COMMAND+=("-p" "${TUNNEL_SSH_PORT[${id}]}")
+    [[ -n "${TUNNEL_JUMP[${id}]}" ]] && BUILT_AUTOSSH_COMMAND+=("-J" "${TUNNEL_JUMP[${id}]}")
 
-    out_cmd+=("${TUNNEL_SERVER[${id}]}")
+    BUILT_AUTOSSH_COMMAND+=("${TUNNEL_SERVER[${id}]}")
 
-    for option in "${out_cmd[@]}"; do
+    for option in "${BUILT_AUTOSSH_COMMAND[@]}"; do
         [[ -n "${option}" ]] || return 1
     done
 }
@@ -331,7 +352,7 @@ is_tunnel_running() {
     local pattern
 
     pattern="$(build_process_pattern "${id}")"
-    pgrep -f "${pattern}" >/dev/null
+    pgrep -f "${pattern}" >/dev/null 2>&1
 }
 
 repeat_char() {
@@ -501,7 +522,6 @@ EOF
 manage_tunnel() {
     local action="${1}"
     local id="${2}"
-    local -a command=()
 
     case "${action}" in
         start)
@@ -510,9 +530,9 @@ manage_tunnel() {
                 return 0
             fi
 
-            build_autossh_command "${id}" command || return 1
+            build_autossh_command "${id}" || return 1
             print_action_message "starting" "${id}" ""
-            if "${command[@]}"; then
+            if "${BUILT_AUTOSSH_COMMAND[@]}"; then
                 print_action_message "started" "${id}" ""
                 return 0
             fi
@@ -527,7 +547,7 @@ manage_tunnel() {
             fi
 
             print_action_message "stopping" "${id}" ""
-            if pkill -f "$(build_process_pattern "${id}")"; then
+            if pkill -f "$(build_process_pattern "${id}")" 2>/dev/null; then
                 print_action_message "stopped" "${id}" ""
                 return 0
             fi
@@ -586,6 +606,7 @@ process_group() {
 main() {
     local action="${1:-help}"
     local group="${2:-all}"
+    local failed=0
 
     load_tunnel_definitions || exit 1
 
@@ -594,8 +615,9 @@ main() {
             process_group "${action}" "${group}"
             ;;
         restart)
-            process_group "stop" "${group}"
-            process_group "start" "${group}"
+            process_group "stop" "${group}" || failed=1
+            process_group "start" "${group}" || failed=1
+            return "${failed}"
             ;;
         list)
             print_tunnel_list
