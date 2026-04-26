@@ -1,279 +1,613 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-GLOBAL_SSH_OPTS="-TqTnN"
-# GLOBAL_SSH_JUMP="hwj@10.61.190.16:18022"
-# GLOBAL_SSH_KEY="~/.ssh/id_rsa"
+# ==============================================================================
+# Configuration
+# ==============================================================================
 
-declare -A TUNNEL_CONFIG=()
+SCRIPT_NAME="$(basename "$0")"
+SCRIPT_VERSION="4.0"
 
-# 隧道配置 (组名:隧道名字 -> 隧道参数)
-TUNNEL_CONFIG["starry:gpu02"]="type=L L=:22022 R=127.0.0.1:22022 S=gpu02"
-# 测试密钥配置的示例（注释掉，使用时取消注释）
-# TUNNEL_CONFIG["test:test-key"]="type=L L=:2222 R=127.0.0.1:22 S=test-server K=~/.ssh/id_rsa"
+# Shared autossh and ssh options applied to every tunnel unless overridden.
+# Keep each option as one array item so spaces in later arguments are safe.
+GLOBAL_AUTOSSH_OPTIONS=(
+    "-f"
+)
 
-parse_tunnel_config() {
-    local tunnel_name="$1"
-    shift
-    local config_str="$@"
+GLOBAL_SSH_OPTIONS=(
+    "-T"
+    "-q"
+    "-n"
+    "-N"
+)
 
-    declare -A config=()
+# Optional shared SSH settings. Per-tunnel values override these defaults.
+GLOBAL_SSH_JUMP=""
+GLOBAL_SSH_KEY=""
 
-    # 解析隧道名
-    IFS=':' read -r group_name tunnel_name <<< "$tunnel_name"
-    if [[ -z $tunnel_name ]]; then
-        config[group]="default"
-        config[name]="$group_name"
+# Tunnel definitions.
+#
+# Each tunnel is a readable key/value block. Supported keys:
+#   group        Required. Group name used by start/stop/status commands.
+#   name         Required. Tunnel name displayed in status output.
+#   mode         Optional. local-forward, remote-forward, or socks-proxy.
+#                Short aliases local/L, remote/R, and dynamic/D are accepted.
+#                Default: local-forward.
+#   local        Required. Local bind address/port, for example :22022.
+#   remote       Required for local-forward and remote-forward mode.
+#                Remote host:port.
+#   server       Required. SSH login server, optionally server:port.
+#   ssh_port     Optional. SSH port. Overrides server:port when both are set.
+#   jump         Optional. SSH jump host, equivalent to ssh -J.
+#   key          Optional. SSH identity file, equivalent to ssh -i.
+#   ssh_options  Optional. Extra ssh options split on spaces.
+#   description  Optional. Human-readable note shown in --help.
+#
+# Add a new tunnel by copying one block and changing its values.
+TUNNEL_DEFINITIONS=(
+"
+group=starry
+name=gpu02
+mode=local-forward
+local=:22022
+remote=127.0.0.1:22022
+server=gpu02
+description=GPU02 SSH tunnel
+"
+
+# Example with a per-tunnel identity file:
+# "
+# group=test
+# name=test-key
+# mode=local-forward
+# local=:2222
+# remote=127.0.0.1:22
+# server=test-server
+# key=~/.ssh/id_rsa
+# description=Example tunnel with a custom SSH key
+# "
+)
+
+
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+declare -a TUNNEL_IDS=()
+declare -A TUNNEL_GROUP=()
+declare -A TUNNEL_NAME=()
+declare -A TUNNEL_MODE=()
+declare -A TUNNEL_LOCAL=()
+declare -A TUNNEL_REMOTE=()
+declare -A TUNNEL_SERVER=()
+declare -A TUNNEL_SSH_PORT=()
+declare -A TUNNEL_JUMP=()
+declare -A TUNNEL_KEY=()
+declare -A TUNNEL_SSH_OPTIONS=()
+declare -A TUNNEL_DESCRIPTION=()
+
+trim() {
+    local value="${1}"
+
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s\n' "${value}"
+}
+
+expand_path() {
+    local value="${1}"
+
+    if [[ "${value}" == "~" ]]; then
+        printf '%s\n' "${HOME}"
+    elif [[ "${value}" == "~/"* ]]; then
+        printf '%s\n' "${HOME}/${value#~/}"
     else
-        config[group]="$group_name"
-        config[name]="$tunnel_name"
+        printf '%s\n' "${value}"
     fi
+}
 
-    # 解析键值对
-    while IFS='=' read -r key value; do
-        [[ -n $key ]] && [[ -n $value ]] && config["$key"]="$value"
-    done < <(echo "$config_str" | tr ' ' '\n')
+normalize_mode() {
+    local mode="${1:-local-forward}"
 
-    # 检查必要值
-    if [[ -z "${config[S]}" ]]; then
-        echo "Missing server (S) in tunnel configuration for ${config[group]}:${config[name]}"
-        return 1
-    fi
-
-    if [[ -z "${config[L]}" ]]; then
-        echo "Missing local port (L) in tunnel configuration for ${config[group]}:${config[name]}"
-        return 1
-    fi
-
-    if [[ -z "${config[R]}" ]]; then
-        if [[ "${config[type]}" != "D" ]]; then
-            echo "Missing remote port (R) in tunnel configuration for ${config[group]}:${config[name]}"
+    case "${mode}" in
+        local-forward|local|L)
+            printf '%s\n' "local-forward"
+            ;;
+        remote-forward|remote|R)
+            printf '%s\n' "remote-forward"
+            ;;
+        socks-proxy|dynamic|D)
+            printf '%s\n' "socks-proxy"
+            ;;
+        *)
             return 1
-        fi
-    fi
+            ;;
+    esac
+}
 
-    # 解析服务器参数
-    IFS=':' read -r server_ip server_port <<< "${config[S]}"
-    if [[ -z "$server_ip" ]]; then
-        echo "Invalid server IP in tunnel configuration for ${config[group]}:${config[name]}"
+mode_label() {
+    local mode="${1}"
+
+    case "${mode}" in
+        local-forward)
+            printf '%s\n' "local-forward"
+            ;;
+        remote-forward)
+            printf '%s\n' "remote-forward"
+            ;;
+        socks-proxy)
+            printf '%s\n' "socks-proxy"
+            ;;
+    esac
+}
+
+regex_escape() {
+    local value="${1}"
+
+    printf '%s\n' "${value}" | sed -e 's/[][(){}.^$*+?|\\/]/\\&/g'
+}
+
+parse_definition() {
+    local definition="${1}"
+    local index="${2}"
+    local line key value id server host port normalized_mode
+    local -A cfg=()
+
+    while IFS= read -r line; do
+        line="$(trim "${line}")"
+        [[ -z "${line}" || "${line}" == \#* ]] && continue
+        [[ "${line}" != *=* ]] && continue
+
+        key="$(trim "${line%%=*}")"
+        value="$(trim "${line#*=}")"
+        cfg["${key}"]="${value}"
+    done <<< "${definition}"
+
+    cfg[mode]="${cfg[mode]:-local}"
+    normalized_mode="$(normalize_mode "${cfg[mode]}")" || {
+        echo "Error: invalid mode '${cfg[mode]}' in tunnel definition #${index}." >&2
+        return 1
+    }
+    cfg[mode]="${normalized_mode}"
+
+    if [[ -z "${cfg[group]}" || -z "${cfg[name]}" ]]; then
+        echo "Error: tunnel definition #${index} must set group and name." >&2
         return 1
     fi
-    
-    config[S]="$server_ip"
-    [[ -n "$server_port" ]] && config[P]="$server_port"
 
-    # 设置默认值
-    [[ -z "${config[type]}" ]] && config[type]="L"
-    [[ -z "${config[K]}" ]] && [[ -n "${GLOBAL_SSH_KEY}" ]] && config[K]="${GLOBAL_SSH_KEY}"
-    [[ -z "${config[J]}" ]] && [[ -n "${GLOBAL_SSH_JUMP}" ]] && config[J]="${GLOBAL_SSH_JUMP}"
-    [[ -z "${config[O]}" ]] && [[ -n "${GLOBAL_SSH_OPTS}" ]] && config[O]="${GLOBAL_SSH_OPTS}"
-
-    # 展开密钥路径中的~符号
-    if [[ -n "${config[K]}" ]]; then
-        config[K]="${config[K]/\~/$HOME}"
+    if [[ -z "${cfg[server]}" ]]; then
+        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set server." >&2
+        return 1
     fi
 
-    declare -p config | sed -e "s/^declare -A config=//"
+    if [[ -z "${cfg[local]}" ]]; then
+        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set local." >&2
+        return 1
+    fi
+
+    if [[ "${cfg[mode]}" != "socks-proxy" && -z "${cfg[remote]}" ]]; then
+        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' must set remote for ${cfg[mode]} mode." >&2
+        return 1
+    fi
+
+    IFS=':' read -r host port <<< "${cfg[server]}"
+    if [[ -z "${host}" ]]; then
+        echo "Error: tunnel '${cfg[group]}:${cfg[name]}' has an invalid server value." >&2
+        return 1
+    fi
+    cfg[server]="${host}"
+    cfg[ssh_port]="${cfg[ssh_port]:-${port}}"
+
+    cfg[key]="${cfg[key]:-${GLOBAL_SSH_KEY}}"
+    cfg[jump]="${cfg[jump]:-${GLOBAL_SSH_JUMP}}"
+    [[ -n "${cfg[key]}" ]] && cfg[key]="$(expand_path "${cfg[key]}")"
+
+    id="${cfg[group]}:${cfg[name]}"
+    TUNNEL_IDS+=("${id}")
+    TUNNEL_GROUP["${id}"]="${cfg[group]}"
+    TUNNEL_NAME["${id}"]="${cfg[name]}"
+    TUNNEL_MODE["${id}"]="${cfg[mode]}"
+    TUNNEL_LOCAL["${id}"]="${cfg[local]}"
+    TUNNEL_REMOTE["${id}"]="${cfg[remote]}"
+    TUNNEL_SERVER["${id}"]="${cfg[server]}"
+    TUNNEL_SSH_PORT["${id}"]="${cfg[ssh_port]}"
+    TUNNEL_JUMP["${id}"]="${cfg[jump]}"
+    TUNNEL_KEY["${id}"]="${cfg[key]}"
+    TUNNEL_SSH_OPTIONS["${id}"]="${cfg[ssh_options]}"
+    TUNNEL_DESCRIPTION["${id}"]="${cfg[description]}"
+}
+
+load_tunnel_definitions() {
+    local index
+
+    for index in "${!TUNNEL_DEFINITIONS[@]}"; do
+        parse_definition "${TUNNEL_DEFINITIONS[${index}]}" "$((index + 1))" || return 1
+    done
 }
 
 get_groups() {
-    declare -a groups=()
+    local id
 
-    for key in "${!TUNNEL_CONFIG[@]}"; do
-        local parsed_config=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
-        eval "declare -A cfg=${parsed_config}"
-        groups+=("${cfg[group]}")
-    done
-
-    printf "%s\n" "${groups[@]}" | sort -u
+    for id in "${TUNNEL_IDS[@]}"; do
+        printf '%s\n' "${TUNNEL_GROUP[${id}]}"
+    done | sort -u
 }
 
-build_ssh_command() {
-    local config_str="$1"
-    eval "declare -A cfg=${config_str}"
+group_exists() {
+    local requested="${1}"
+    local group
 
-    local cmd="autossh -f"
+    [[ "${requested}" == "all" ]] && return 0
 
-    [[ -n "${cfg[O]}" ]] && cmd+=" ${cfg[O]}"
-    
-    case "${cfg[type]}" in
-        L) cmd+=" -L ${cfg[L]}:${cfg[R]}" ;;
-        R) cmd+=" -R ${cfg[R]}:${cfg[L]}" ;;
-        D) cmd+=" -D ${cfg[L]}" ;;
+    while IFS= read -r group; do
+        [[ "${group}" == "${requested}" ]] && return 0
+    done < <(get_groups)
+
+    return 1
+}
+
+print_available_groups() {
+    local group
+
+    printf 'Available groups: all'
+    while IFS= read -r group; do
+        printf ', %s' "${group}"
+    done < <(get_groups)
+    printf '\n'
+}
+
+tunnel_matches_group() {
+    local id="${1}"
+    local group="${2}"
+
+    [[ "${group}" == "all" || "${TUNNEL_GROUP[${id}]}" == "${group}" ]]
+}
+
+build_autossh_command() {
+    local id="${1}"
+    local -n out_cmd="${2}"
+    local option mode
+
+    out_cmd=("autossh")
+    out_cmd+=("${GLOBAL_AUTOSSH_OPTIONS[@]}")
+    out_cmd+=("${GLOBAL_SSH_OPTIONS[@]}")
+
+    if [[ -n "${TUNNEL_SSH_OPTIONS[${id}]}" ]]; then
+        # shellcheck disable=SC2206
+        local extra_options=(${TUNNEL_SSH_OPTIONS[${id}]})
+        out_cmd+=("${extra_options[@]}")
+    fi
+
+    mode="${TUNNEL_MODE[${id}]}"
+    case "${mode}" in
+        local-forward)
+            out_cmd+=("-L" "${TUNNEL_LOCAL[${id}]}:${TUNNEL_REMOTE[${id}]}")
+            ;;
+        remote-forward)
+            out_cmd+=("-R" "${TUNNEL_REMOTE[${id}]}:${TUNNEL_LOCAL[${id}]}")
+            ;;
+        socks-proxy)
+            out_cmd+=("-D" "${TUNNEL_LOCAL[${id}]}")
+            ;;
     esac
 
-    [[ -n "${cfg[K]}" ]] && cmd+=" -i ${cfg[K]}"
-    [[ -n "${cfg[P]}" ]] && cmd+=" -p ${cfg[P]}"
-    [[ -n "${cfg[J]}" ]] && cmd+=" -J ${cfg[J]}"
+    [[ -n "${TUNNEL_KEY[${id}]}" ]] && out_cmd+=("-i" "${TUNNEL_KEY[${id}]}")
+    [[ -n "${TUNNEL_SSH_PORT[${id}]}" ]] && out_cmd+=("-p" "${TUNNEL_SSH_PORT[${id}]}")
+    [[ -n "${TUNNEL_JUMP[${id}]}" ]] && out_cmd+=("-J" "${TUNNEL_JUMP[${id}]}")
 
-    cmd+=" ${cfg[S]}"
+    out_cmd+=("${TUNNEL_SERVER[${id}]}")
 
-    echo "$cmd"
+    for option in "${out_cmd[@]}"; do
+        [[ -n "${option}" ]] || return 1
+    done
 }
 
 build_process_pattern() {
-    local config_str="$1"
-    eval "declare -A cfg=${config_str}"
-    
+    local id="${1}"
+    local mode="${TUNNEL_MODE[${id}]}"
     local pattern="autossh"
-    
-    case "${cfg[type]}" in
-        L) pattern+=" .*-L ${cfg[L]}:${cfg[R]}" ;;
-        R) pattern+=" .*-R ${cfg[R]}:${cfg[L]}" ;;
-        D) pattern+=" .*-D ${cfg[L]}" ;;
-    esac
 
-    [[ -n "${cfg[K]}" ]] && pattern+=" .*-i .*${cfg[K]}"
-    [[ -n "${cfg[P]}" ]] && pattern+=" -p ${cfg[P]}"
-    [[ -n "${cfg[J]}" ]] && pattern+=" -J ${cfg[J]}"
-
-    pattern+=" ${cfg[S]}"
-    
-    echo "$pattern"
-}
-
-
-manage_tunnel() {
-    local action="$1"
-    local config_str="$2"
-    eval "declare -A cfg=${config_str}"
-
-    local ssh_cmd=$(build_ssh_command "$config_str")
-    local pattern=$(build_process_pattern "$config_str")
-
-    local group="${cfg[group]}"
-    local tunnel_name="${cfg[name]}"
-
-    case $action in
-        start)
-            if ! pgrep -f "$pattern" >/dev/null; then
-                echo "启动隧道: [$group] $tunnel_name"
-                eval "$ssh_cmd"
-                return $?
-            else
-                echo "隧道已在运行: [$group] $tunnel_name"
-                return 0
-            fi
+    case "${mode}" in
+        local-forward)
+            pattern+=" .*-L $(regex_escape "${TUNNEL_LOCAL[${id}]}:${TUNNEL_REMOTE[${id}]}")"
             ;;
-        stop)
-            if pgrep -f "$pattern" >/dev/null; then
-                echo "停止隧道: [$group] $tunnel_name"
-                pkill -f "$pattern"
-                return $?
-            else
-                echo "隧道未运行: [$group] $tunnel_name"
-                return 0
-            fi
+        remote-forward)
+            pattern+=" .*-R $(regex_escape "${TUNNEL_REMOTE[${id}]}:${TUNNEL_LOCAL[${id}]}")"
             ;;
-        status)
-            if pgrep -f "$pattern" >/dev/null; then
-                printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
-                    "[RUNNING]" "$tunnel_name" "${cfg[L]}" "${cfg[type]}" \
-                    "${cfg[R]:-N/A}" "${cfg[S]}"
-                return 0
-            else
-                printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
-                    "[STOPPED]" "$tunnel_name" "${cfg[L]}" "${cfg[type]}" \
-                    "${cfg[R]:-N/A}" "${cfg[S]}"
-                return 1
-            fi
+        socks-proxy)
+            pattern+=" .*-D $(regex_escape "${TUNNEL_LOCAL[${id}]}")"
             ;;
     esac
+
+    [[ -n "${TUNNEL_KEY[${id}]}" ]] && pattern+=" .*-i $(regex_escape "${TUNNEL_KEY[${id}]}")"
+    [[ -n "${TUNNEL_SSH_PORT[${id}]}" ]] && pattern+=" .*-p $(regex_escape "${TUNNEL_SSH_PORT[${id}]}")"
+    [[ -n "${TUNNEL_JUMP[${id}]}" ]] && pattern+=" .*-J $(regex_escape "${TUNNEL_JUMP[${id}]}")"
+    pattern+=" .*$(regex_escape "${TUNNEL_SERVER[${id}]}")"
+
+    printf '%s\n' "${pattern}"
 }
 
+is_tunnel_running() {
+    local id="${1}"
+    local pattern
 
-process_group() {
-    local action=$1
-    local group=$2
-    
-    # 特殊处理：all组包含所有隧道
-    if [[ "$group" == "all" ]]; then
-        # for key in "${!TUNNEL_CONFIG[@]}"; do
-        #     local config_str=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
-        #     manage_tunnel "$action" "$config_str"
-        # done
-        for group in $TUNNEL_GROUPS; do
-            process_group "$action" "$group"
-            echo ""
-        done
-        return 0
-    fi
-    
-    # 检查组是否存在
-    local group_exists=0
-    for key in $TUNNEL_GROUPS; do
-        if [[ "$key" == "$group" ]]; then
-          group_exists=1
-          break
-        fi
-    done
-    
-    if [[ $group_exists -eq 0 ]]; then
-        echo "错误: 无效的组名 '$group'"
-        return 1
-    fi
-    
-    echo "========================================"
-    echo "处理组: $group"
-    echo "操作: $action"
-    echo "========================================"
-    printf "%-15s %-25s %-10s %-8s %-15s %-15s\n" \
-        "STATUS" "NAME" "LOCAL" "TYPE" "REMOTE" "SERVER"
-    echo "------------------------------------------------------------------------------------------------"
-    for key in "${!TUNNEL_CONFIG[@]}"; do
-        local config_str=$(parse_tunnel_config "${key}" "${TUNNEL_CONFIG[${key}]}")
-        eval "declare -A cfg=${config_str}"
-
-        if [[ "${cfg[group]}" == "$group" ]]; then
-            manage_tunnel "$action" "$config_str"
-        fi
-    done
-    echo ""
-    return 0
+    pattern="$(build_process_pattern "${id}")"
+    pgrep -f "${pattern}" >/dev/null
 }
 
+repeat_char() {
+    local char="${1}"
+    local count="${2}"
+    local line=""
+
+    while (( count > 0 )); do
+        line+="${char}"
+        ((count--))
+    done
+
+    printf '%s\n' "${line}"
+}
+
+print_section() {
+    local title="${1}"
+
+    printf '%s\n' "${title}"
+    repeat_char "-" "${#title}"
+}
+
+tunnel_endpoint() {
+    local id="${1}"
+    local mode="${TUNNEL_MODE[${id}]}"
+
+    case "${mode}" in
+        local-forward)
+            printf '%s -> %s\n' "${TUNNEL_LOCAL[${id}]}" "${TUNNEL_REMOTE[${id}]}"
+            ;;
+        remote-forward)
+            printf '%s <- %s\n' "${TUNNEL_REMOTE[${id}]}" "${TUNNEL_LOCAL[${id}]}"
+            ;;
+        socks-proxy)
+            printf '%s\n' "${TUNNEL_LOCAL[${id}]}"
+            ;;
+    esac
+}
+
+tunnel_server_label() {
+    local id="${1}"
+    local server="${TUNNEL_SERVER[${id}]}"
+
+    if [[ -n "${TUNNEL_SSH_PORT[${id}]}" ]]; then
+        server+=":${TUNNEL_SSH_PORT[${id}]}"
+    fi
+
+    printf '%s\n' "${server}"
+}
+
+tunnel_label() {
+    local id="${1}"
+
+    printf '%s/%s' "${TUNNEL_GROUP[${id}]}" "${TUNNEL_NAME[${id}]}"
+}
+
+print_action_message() {
+    local action="${1}"
+    local id="${2}"
+    local message="${3}"
+
+    printf "%-10s %-24s %-16s %-28s via %s\n" \
+        "${action}" \
+        "$(tunnel_label "${id}")" \
+        "$(mode_label "${TUNNEL_MODE[${id}]}")" \
+        "$(tunnel_endpoint "${id}")" \
+        "$(tunnel_server_label "${id}")"
+
+    [[ -n "${message}" ]] && printf "           %s\n" "${message}"
+}
+
+print_status_header() {
+    printf "%-10s %-12s %-22s %-16s %-18s %-24s %-18s %s\n" \
+        "STATE" "GROUP" "NAME" "MODE" "LOCAL" "REMOTE" "SSH SERVER" "DESCRIPTION"
+    repeat_char "-" 144
+}
+
+print_tunnel_status() {
+    local id="${1}"
+    local status="${2}"
+
+    printf "%-10s %-12s %-22s %-16s %-18s %-24s %-18s %s\n" \
+        "${status}" \
+        "${TUNNEL_GROUP[${id}]}" \
+        "${TUNNEL_NAME[${id}]}" \
+        "$(mode_label "${TUNNEL_MODE[${id}]}")" \
+        "${TUNNEL_LOCAL[${id}]}" \
+        "${TUNNEL_REMOTE[${id}]:-N/A}" \
+        "$(tunnel_server_label "${id}")" \
+        "${TUNNEL_DESCRIPTION[${id}]}"
+}
+
+print_tunnel_list() {
+    local id description
+
+    printf "%-12s %-22s %-16s %-18s %-24s %-18s %s\n" \
+        "GROUP" "NAME" "MODE" "LOCAL" "REMOTE" "SSH SERVER" "DESCRIPTION"
+    repeat_char "-" 139
+
+    for id in "${TUNNEL_IDS[@]}"; do
+        description="${TUNNEL_DESCRIPTION[${id}]}"
+        printf "%-12s %-22s %-16s %-18s %-24s %-18s %s\n" \
+            "${TUNNEL_GROUP[${id}]}" \
+            "${TUNNEL_NAME[${id}]}" \
+            "$(mode_label "${TUNNEL_MODE[${id}]}")" \
+            "${TUNNEL_LOCAL[${id}]}" \
+            "${TUNNEL_REMOTE[${id}]:-N/A}" \
+            "$(tunnel_server_label "${id}")" \
+            "${description}"
+    done
+}
 
 show_usage() {
-    echo "隧道管理脚本 v3.0"
-    echo "用法: $0 {start|stop|restart|status} [组名]"
-    echo ""
-    echo "可用组:"
-    echo "  - all (所有隧道)"
-    
-    # 获取并显示所有唯一组名
-    for group in $TUNNEL_GROUPS; do
-        echo "  - $group"
-    done
-    
-    echo ""
-    echo "隧道配置选项:"
-    echo "  type=L/R/D     隧道类型 (默认: L)"
-    echo "  L=             本地端口"
-    echo "  R=             远程端口"
-    echo "  S=             登陆服务器"
-    echo "  J=             跳板机"
+    local group
+
+    cat << EOF
+autossh-manager v${SCRIPT_VERSION}
+
+Usage:
+  ${SCRIPT_NAME} {start|stop|restart|status} [group]
+  ${SCRIPT_NAME} list
+  ${SCRIPT_NAME} help
+
+Groups:
+  all
+EOF
+
+    while IFS= read -r group; do
+        printf '  %s\n' "${group}"
+    done < <(get_groups)
+
+    printf '\n'
+    print_section "Configured Tunnels"
+    print_tunnel_list
+
+    cat << 'EOF'
+
+Configuration Fields:
+  group        Group name used by commands.
+  name         Display name for the tunnel.
+  mode         local-forward, remote-forward, or socks-proxy.
+               Short aliases local/L, remote/R, and dynamic/D are also accepted.
+  local        Local endpoint, for example :22022.
+  remote       Remote endpoint. Required for local-forward and remote-forward.
+  server       SSH server, optionally server:port.
+  ssh_port     SSH port override.
+  jump         SSH jump host, equivalent to ssh -J.
+  key          SSH identity file, equivalent to ssh -i.
+  ssh_options  Extra SSH options split on spaces.
+  description  Note shown in this help output.
+
+Mode Meanings:
+  local-forward   ssh -L. Listen locally and forward traffic through SSH to
+                  the remote-side destination.
+  remote-forward  ssh -R. Listen on the SSH server side and forward traffic
+                  back through SSH to the local-side destination.
+  socks-proxy     ssh -D. Listen locally as a SOCKS4/5 proxy and choose the
+                  target dynamically per connection.
+EOF
 }
 
-if [[ $# -lt 1 ]]; then
-    show_usage
-    exit 1
-fi
 
-ACTION=$1
-GROUP=${2:-all}
-TUNNEL_GROUPS=$(get_groups)
+# ==============================================================================
+# Business Logic
+# ==============================================================================
 
-case $ACTION in
-    start|stop|status)
-        process_group "$ACTION" "$GROUP"
-        ;;
-    restart)
-        process_group "stop" "$GROUP"
-        process_group "start" "$GROUP"
-        ;;
-    *)
-        show_usage
-        exit 1
-        ;;
-esac
+manage_tunnel() {
+    local action="${1}"
+    local id="${2}"
+    local -a command=()
 
+    case "${action}" in
+        start)
+            if is_tunnel_running "${id}"; then
+                print_action_message "running" "${id}" "Tunnel is already active."
+                return 0
+            fi
 
+            build_autossh_command "${id}" command || return 1
+            print_action_message "starting" "${id}" ""
+            if "${command[@]}"; then
+                print_action_message "started" "${id}" ""
+                return 0
+            fi
+
+            print_action_message "failed" "${id}" "autossh exited with an error."
+            return 1
+            ;;
+        stop)
+            if ! is_tunnel_running "${id}"; then
+                print_action_message "stopped" "${id}" "Tunnel is not running."
+                return 0
+            fi
+
+            print_action_message "stopping" "${id}" ""
+            if pkill -f "$(build_process_pattern "${id}")"; then
+                print_action_message "stopped" "${id}" ""
+                return 0
+            fi
+
+            print_action_message "failed" "${id}" "Could not stop matching autossh process."
+            return 1
+            ;;
+        status)
+            if is_tunnel_running "${id}"; then
+                print_tunnel_status "${id}" "running"
+                return 0
+            fi
+
+            print_tunnel_status "${id}" "stopped"
+            return 0
+            ;;
+        *)
+            echo "Error: unsupported action '${action}'." >&2
+            return 1
+            ;;
+    esac
+}
+
+process_group() {
+    local action="${1}"
+    local group="${2}"
+    local id failed=0 matched=0
+
+    if ! group_exists "${group}"; then
+        echo "Error: invalid group '${group}'." >&2
+        print_available_groups >&2
+        return 1
+    fi
+
+    print_section "autossh-manager: ${action} (${group})"
+    if [[ "${action}" == "status" ]]; then
+        print_status_header
+    fi
+
+    for id in "${TUNNEL_IDS[@]}"; do
+        tunnel_matches_group "${id}" "${group}" || continue
+        matched=1
+        if ! manage_tunnel "${action}" "${id}"; then
+            failed=1
+        fi
+    done
+
+    [[ "${matched}" -eq 1 ]] || {
+        echo "No tunnels matched group '${group}'." >&2
+        return 1
+    }
+
+    return "${failed}"
+}
+
+main() {
+    local action="${1:-help}"
+    local group="${2:-all}"
+
+    load_tunnel_definitions || exit 1
+
+    case "${action}" in
+        start|stop|status)
+            process_group "${action}" "${group}"
+            ;;
+        restart)
+            process_group "stop" "${group}"
+            process_group "start" "${group}"
+            ;;
+        list)
+            print_tunnel_list
+            ;;
+        help|-h|--help)
+            show_usage
+            ;;
+        *)
+            show_usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
