@@ -17,8 +17,10 @@ RUN apt-get update && \
       git \
       git-lfs \
       htop \
+      vim \
       jq \
       lsof \
+      tree \
       net-tools \
       less \
       patch \
@@ -31,6 +33,7 @@ RUN apt-get update && \
       python3-pip \
       python3-venv \
       ripgrep \
+      bubblewrap \
       rsync \
       strace \
       sudo \

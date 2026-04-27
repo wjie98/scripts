@@ -2,6 +2,15 @@
 
 set -u
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || {
+  printf '[ERROR] Failed to resolve script directory: %s\n' "$0" >&2
+  exit 1
+}
+cd "$SCRIPT_DIR" || {
+  printf '[ERROR] Failed to enter script directory: %s\n' "$SCRIPT_DIR" >&2
+  exit 1
+}
+
 CONTAINER_CMD="${CONTAINER_CMD:-docker}"
 IMAGE_NAME="${IMAGE_NAME:-devbox-ubuntu:24.04}"
 DOCKERFILE_PATH="${DOCKERFILE_PATH:-Dockerfile}"

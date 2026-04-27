@@ -7,6 +7,10 @@
 # Replaceable container runtime command
 CONTAINER_CMD="${CONTAINER_CMD:-docker}"
 
+# Script name used in help text. zsh may set $0 to the function name inside
+# functions, so keep the original entrypoint name here.
+SCRIPT_NAME="${0##*/}"
+
 # Shared container name prefix
 CONTAINER_PREFIX="${CONTAINER_PREFIX:-devbox-}"
 
@@ -28,30 +32,78 @@ PORT_RANGE_END="${PORT_RANGE_END:-39999}"
 
 # Proxy environment variables mirrored into generated helper functions.
 PROXY_ENV_VARS=(
-  http_proxy
-  https_proxy
-  all_proxy
-  socks_proxy
-  no_proxy
-  HTTP_PROXY
-  HTTPS_PROXY
-  ALL_PROXY
-  SOCKS_PROXY
-  NO_PROXY
-  GOPROXY
+  HOST_IP
 )
 
-# Files or directories to sync during deploy
+# Files or directories to sync during deploy.
+# Keep related entries in separate blocks so a whole block can be toggled by
+# commenting its DEPLOY_SYNC_FILES+=(...) section.
 # Format: "source_path:target_path"
 # Supported target placeholders: {{DEVBOX_HOME}}, {{DEVBOX_USER}}, {{CONTAINER_WORKDIR}}
-DEPLOY_SYNC_FILES=(
-  # "$HOME/.gitconfig:{{DEVBOX_HOME}}/.gitconfig"
-  # "$HOME/.ssh/config:{{DEVBOX_HOME}}/.ssh/config"
+DEPLOY_SYNC_FILES=()
+
+# Shell and package-manager state
+DEPLOY_SYNC_FILES+=(
+  "$HOME/.gitconfig:{{DEVBOX_HOME}}/.gitconfig"
+  "$HOME/.ssh/config:{{DEVBOX_HOME}}/.ssh/config"
+  "$HOME/.bun:{{DEVBOX_HOME}}/.bun"
+  "$HOME/.nvm:{{DEVBOX_HOME}}/.nvm"
+  "$HOME/.local/share/uv:{{DEVBOX_HOME}}/.local/share/uv"
+  "$HOME/.local/bin/uv:{{DEVBOX_HOME}}/.local/bin/uv"
+  "$HOME/.local/bin/uvx:{{DEVBOX_HOME}}/.local/bin/uvx"
+)
+
+# Environment files
+DEPLOY_SYNC_FILES+=(
+  "$HOME/.opt/proxy.env:{{DEVBOX_HOME}}/.opt/proxy.env"
+  "$HOME/.opt/auth.env:{{DEVBOX_HOME}}/.opt/auth.env"
+  "$HOME/.opt/cc.env:{{DEVBOX_HOME}}/.opt/cc.env"
+)
+
+# Agent/tool configuration
+DEPLOY_SYNC_FILES+=(
+  "$HOME/.claude:{{DEVBOX_HOME}}/.claude"
+  "$HOME/.claude.json:{{DEVBOX_HOME}}/.claude.json"
+  "$HOME/.local/share/claude:{{DEVBOX_HOME}}/.local/share/claude"
+  "$HOME/.local/bin/claude:{{DEVBOX_HOME}}/.local/bin/claude"
+  "$HOME/.codex:{{DEVBOX_HOME}}/.codex"
+  "$HOME/.pi:{{DEVBOX_HOME}}/.pi"
+  "$HOME/.omp:{{DEVBOX_HOME}}/.omp"
+)
+
+# Project-local examples
+DEPLOY_SYNC_FILES+=(
   # "$HOME/project.env:{{CONTAINER_WORKDIR}}/.env"
 )
 
-# Commands to run during deploy
-DEPLOY_COMMANDS=(
+# Commands to run during deploy.
+# Keep related entries in separate blocks so a whole block can be toggled by
+# commenting its DEPLOY_COMMANDS+=(...) section.
+# Supported placeholders: {{DEVBOX_HOME}}, {{DEVBOX_USER}}, {{CONTAINER_WORKDIR}}
+DEPLOY_COMMANDS=()
+
+# Environment files loaded by interactive shells
+DEPLOY_COMMANDS+=(
+  "grep -qxF '[ -f \"\${HOME}/.opt/proxy.env\" ] && . \"\${HOME}/.opt/proxy.env\" && proxy_on' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' '[ -f \"\${HOME}/.opt/proxy.env\" ] && . \"\${HOME}/.opt/proxy.env\" && proxy_on' >> \"{{DEVBOX_HOME}}/.bashrc\""
+  "grep -qxF '[ -f \"\${HOME}/.opt/auth.env\" ] && . \"\${HOME}/.opt/auth.env\"' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' '[ -f \"\${HOME}/.opt/auth.env\" ] && . \"\${HOME}/.opt/auth.env\"' >> \"{{DEVBOX_HOME}}/.bashrc\""
+  "grep -qxF '[ -f \"\${HOME}/.opt/cc.env\" ] && . \"\${HOME}/.opt/cc.env\"' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' '[ -f \"\${HOME}/.opt/cc.env\" ] && . \"\${HOME}/.opt/cc.env\"' >> \"{{DEVBOX_HOME}}/.bashrc\""
+)
+
+# nvm initialization
+DEPLOY_COMMANDS+=(
+  "if [ -d \"{{DEVBOX_HOME}}/.nvm\" ]; then grep -qxF 'export NVM_DIR=\"\${HOME}/.nvm\"' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' 'export NVM_DIR=\"\${HOME}/.nvm\"' >> \"{{DEVBOX_HOME}}/.bashrc\"; fi"
+  "if [ -s \"{{DEVBOX_HOME}}/.nvm/nvm.sh\" ]; then grep -qxF '[ -s \"\${NVM_DIR}/nvm.sh\" ] && \. \"\${NVM_DIR}/nvm.sh\"  # This loads nvm' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' '[ -s \"\${NVM_DIR}/nvm.sh\" ] && \. \"\${NVM_DIR}/nvm.sh\"  # This loads nvm' >> \"{{DEVBOX_HOME}}/.bashrc\"; fi"
+  "if [ -s \"{{DEVBOX_HOME}}/.nvm/bash_completion\" ]; then grep -qxF '[ -s \"\${NVM_DIR}/bash_completion\" ] && \. \"\${NVM_DIR}/bash_completion\"  # This loads nvm bash_completion' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' '[ -s \"\${NVM_DIR}/bash_completion\" ] && \. \"\${NVM_DIR}/bash_completion\"  # This loads nvm bash_completion' >> \"{{DEVBOX_HOME}}/.bashrc\"; fi"
+)
+
+# Bun initialization
+DEPLOY_COMMANDS+=(
+  "if [ -d \"{{DEVBOX_HOME}}/.bun\" ]; then grep -qxF 'export BUN_INSTALL=\"\${HOME}/.bun\"' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' 'export BUN_INSTALL=\"\${HOME}/.bun\"' >> \"{{DEVBOX_HOME}}/.bashrc\"; fi"
+  "if [ -d \"{{DEVBOX_HOME}}/.bun\" ]; then grep -qxF 'export PATH=\"\${BUN_INSTALL}/bin:\${PATH}\"' \"{{DEVBOX_HOME}}/.bashrc\" || printf '%s\n' 'export PATH=\"\${BUN_INSTALL}/bin:\${PATH}\"' >> \"{{DEVBOX_HOME}}/.bashrc\"; fi"
+)
+
+# Package examples
+DEPLOY_COMMANDS+=(
   # "apt-get update"
   # "apt-get install -y git vim curl"
 )
@@ -228,7 +280,7 @@ write_proxy_helper_script() {
   } > "$output_file"
 }
 
-expand_deploy_target_path() {
+expand_deploy_template() {
   local template="$1"
   local dev_user="$2"
   local dev_home="$3"
@@ -239,6 +291,10 @@ expand_deploy_target_path() {
   expanded=${expanded//\{\{CONTAINER_WORKDIR\}\}/$CONTAINER_WORKDIR}
 
   printf '%s\n' "$expanded"
+}
+
+expand_deploy_target_path() {
+  expand_deploy_template "$@"
 }
 
 normalize_container_name() {
@@ -818,12 +874,17 @@ sync_files_to_container() {
 
 run_deploy_commands_in_container() {
   local container="$1"
-  local cmd
+  local cmd expanded_cmd dev_user dev_home
+
+  dev_user=$(get_container_dev_user "$container")
+  dev_home=$(get_container_dev_home "$container" "$dev_user")
+  [ -n "$dev_home" ] || die "Failed to resolve home directory for container user: $dev_user"
 
   for cmd in "${DEPLOY_COMMANDS[@]-}"; do
     [ -n "$cmd" ] || continue
-    info "Running in container: $cmd"
-    container_shell_exec "$container" "$cmd" || die "Deploy command failed: $cmd"
+    expanded_cmd=$(expand_deploy_template "$cmd" "$dev_user" "$dev_home")
+    info "Running in container: $expanded_cmd"
+    container_shell_exec "$container" "$expanded_cmd" || die "Deploy command failed: $expanded_cmd"
   done
 }
 
@@ -907,12 +968,20 @@ sync_files_to_remote() {
 run_deploy_commands_on_remote() {
   local target="$1"
   local port="$2"
-  local cmd
+  local cmd expanded_cmd remote_user remote_home
+
+  remote_user=$(remote_user_name "$target")
+  if [ "$remote_user" = "root" ]; then
+    remote_home="/root"
+  else
+    remote_home="/home/${remote_user}"
+  fi
 
   for cmd in "${DEPLOY_COMMANDS[@]-}"; do
     [ -n "$cmd" ] || continue
-    info "Running on remote host: $cmd"
-    remote_exec "$target" "$port" "$cmd" || die "Remote deploy command failed on ${target}: $cmd"
+    expanded_cmd=$(expand_deploy_template "$cmd" "$remote_user" "$remote_home")
+    info "Running on remote host: $expanded_cmd"
+    remote_exec "$target" "$port" "$expanded_cmd" || die "Remote deploy command failed on ${target}: $expanded_cmd"
   done
 }
 
@@ -1236,17 +1305,17 @@ inspect_container() {
 usage() {
   cat <<EOF
 Usage:
-  $0 list
-  $0 run [name]
-  $0 start [name]
-  $0 stop [name]
-  $0 restart [name]
-  $0 rm [name]
-  $0 info [name]
-  $0 shell [name]
-  $0 ssh [name]
-  $0 deploy [name]
-  $0 deploy-remote [user@]host [-p port]
+  ${SCRIPT_NAME} list
+  ${SCRIPT_NAME} run [name]
+  ${SCRIPT_NAME} start [name]
+  ${SCRIPT_NAME} stop [name]
+  ${SCRIPT_NAME} restart [name]
+  ${SCRIPT_NAME} rm [name]
+  ${SCRIPT_NAME} info [name]
+  ${SCRIPT_NAME} shell [name]
+  ${SCRIPT_NAME} ssh [name]
+  ${SCRIPT_NAME} deploy [name]
+  ${SCRIPT_NAME} deploy-remote [user@]host [-p port]
 
 Notes:
   - Container names can be passed without prefix. Prefix will be added automatically.
