@@ -69,10 +69,6 @@ description=GPU02 SSH tunnel
 # "
 )
 
-is_tunnel_running() {
-    local id="${1}"
-    local pattern
-
 # ==============================================================================
 # Utility Functions
 # ==============================================================================
@@ -516,13 +512,6 @@ Mode Meanings:
                   target dynamically per connection.
 EOF
 }
-
-    case "${action}" in
-        start)
-            if is_tunnel_running "${id}"; then
-                print_action_message "running" "${id}" "Tunnel is already active."
-                return 0
-            fi
 
 # ==============================================================================
 # Business Logic
